@@ -1,134 +1,83 @@
-# CSE 5509 Computer Vision Final Project
-## Improved Single-Camera BEV Driver-Assistance Visualization
+# CSE 5509 Final Project: Single-Camera BEV Scene Visualization
 
-This repository contains a **class-aligned CSE 5509 Computer Vision final project** that builds a mock Bird’s-Eye View (BEV) visualization from monocular street images.
+## Overview
+This project takes multiple street-view images per location (for example, `direction 0.jpg` to `direction 7.jpg`) and generates Bird's-Eye View (BEV)-style visualizations. The outputs combine a segmented scene layout with object markers from instance detection.
 
-The updated pipeline focuses on reproducibility and interpretability:
-- dual-mode path setup (**Colab + local repo**)
-- dynamic dataset discovery (no stale hard-coded image counts)
-- semantic segmentation + cleanup for ground/obstacle separation
-- monocular depth estimation for approximate distance reasoning
-- instance detection with unique labels (`car1`, `car2`, `person1`, ...)
-- geometry-aware BEV projection using an approximate pinhole model
-- per-image outputs + location-level 360° stitched compositing
+This is a course project pipeline, not a calibrated vehicle BEV system. Distances and object positions are approximate because camera intrinsics are assumed (not calibrated) and monocular depth has scale ambiguity.
 
----
+## Methods
+- **Semantic segmentation**: A pretrained SegFormer model predicts per-pixel classes. We use those labels to separate likely ground regions (such as road/sidewalk/terrain) from movable-object regions.
+- **Monocular depth estimation**: A pretrained DPT model predicts relative depth from one image. The depth map is normalized and used for approximate forward range placement in the BEV canvas.
+- **Instance detection**: A pretrained Mask R-CNN detector finds people/vehicles and keeps supported classes (`person`, `car`, `bus`, etc.). Instances are labeled per image as `car1`, `car2`, `person1`, and so on.
+- **Approximate pinhole projection**: Image points are mapped into a top-down canvas using assumed camera intrinsics from image width and a horizontal FOV setting.
+- **Per-location compositing**: Per-direction BEV images are combined with a fixed-angle assumption. When filenames include `direction N`, that index is used for simple rotation before alpha compositing.
+- **Optional ORB/homography checks**: If OpenCV is available and enabled, the pipeline saves feature-match and homography inlier summaries as alignment checks.
 
-## Motivation
-The original notebook produced a BEV-like output but mixed assumptions and hard-coded paths, and it lacked robust instance-level markers.
-
-This revision makes the project easier to run, inspect, and explain in CV terms while staying lightweight and using pretrained models.
-
----
-
-## CSE 5509 topic alignment
-The implementation covers multiple course-relevant computer vision methods:
-
-1. **Semantic segmentation / dense prediction**
-   - SegFormer (Cityscapes) used to infer pixel-level classes.
-2. **Monocular depth estimation / dense prediction**
-   - DPT depth model used to estimate per-pixel relative depth.
-3. **Object detection + instance segmentation (model output includes masks)**
-   - Torchvision Mask R-CNN ResNet50-FPN for `person`, `bicycle`, `car`, `motorcycle`, `bus`, `truck`.
-4. **Camera geometry + pinhole back-projection**
-   - Approximate intrinsics estimated from image width and assumed horizontal FOV.
-5. **Image warping / inverse perspective intuition for BEV rendering**
-   - Ground/object pixels projected into a top-view canvas using depth + camera model.
-6. **Failure analysis and diagnostics**
-   - Intermediate masks and overlays are saved for debugging and limitations analysis.
-
----
-
-## Repository layout
-
+## Repository Structure
 ```text
 cse5509_final_project/
 ├── data/
-│   ├── loc1/ ... loc6/
-│   │   └── direction 0.jpg ... direction 7.jpg
-├── outputs/                    # Generated after running notebook
-│   ├── per_image/
-│   ├── per_location/
-│   ├── tables/
-│   └── diagnostics/
-├── bev_pipeline.py             # Modular helper functions
+├── bev_pipeline.py
 ├── final-project-cse5509-v2.ipynb
-└── README.md
+├── requirements.txt
+└── outputs/
 ```
 
-Dataset counts are discovered at runtime and printed automatically.
+## Dataset Format
+Expected input format:
 
----
+```text
+data/
+  loc1/
+    direction 0.jpg
+    direction 1.jpg
+    ...
+  loc2/
+    direction 0.jpg
+    ...
+```
 
-## Input data format
-Expected structure per location:
-- folder name: `locX`
-- image naming: `direction N.jpg` where `N` is typically `0..7`
-- fixed-angle assumption: for 8 images, each direction is treated as ~45° apart in stitched compositing
+The notebook counts folders and images from `data/` at runtime, so it does not rely on hard-coded totals.
 
----
+## Setup
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+jupyter notebook
+```
 
-## Output structure and examples
-After execution, check:
+Windows activation command:
 
-- `outputs/per_image/*_bev.png` — BEV with ego marker, range guides, and instance labels.
-- `outputs/per_image/*_det.png` — detection overlay in camera image space.
-- `outputs/diagnostics/*_raw_seg.png` — raw segmentation preview.
-- `outputs/diagnostics/*_ground_mask.png` — cleaned ground mask.
-- `outputs/diagnostics/*_object_mask.png` — cleaned object mask.
-- `outputs/tables/*_instances.json` — per-image instance table with class, confidence, bbox, contact point, depth, BEV coordinate.
-- `outputs/per_location/*_stitched_bev.png` — stitched location-level BEV composite.
+```bash
+.venv\Scripts\activate
+```
 
----
+On the first run, pretrained model weights may be downloaded, so model initialization can take a while.
 
-## How to run (local)
+## Running the Notebook
+1. Open `final-project-cse5509-v2.ipynb`.
+2. Run cells from top to bottom.
+3. `run_small_demo=True` runs a small subset for quick checking.
+4. Set `run_small_demo=False` for the full dataset.
+5. Confirm the printed `Data dir` path before running the pipeline.
+6. Outputs are saved under `outputs/`.
 
-1. Create and activate a Python environment.
-2. Install dependencies (see `requirements.txt`).
-3. From repository root, run Jupyter and open notebook:
-   - `final-project-cse5509-v2.ipynb`
-4. In the config cell:
-   - set `RUN_SMALL_DEMO=True` (default) for quick validation
-   - set `RUN_SMALL_DEMO=False` for full dataset pass
-5. Run all cells.
+## Outputs
+- `outputs/per_image/`: per-image BEV images and detection overlays.
+- `outputs/per_location/`: combined per-location BEV composite image.
+- `outputs/diagnostics/`: segmentation masks and intermediate visualizations.
+- `outputs/tables/`: JSON summaries for detections and compositing/alignment checks.
+- `outputs/run_report.json`: run summary for processed locations/images.
 
----
+## Assumptions and Limitations
+- Monocular depth is relative, not metric.
+- Camera intrinsics are assumed from image size and horizontal FOV.
+- Ground-plane projection is approximate.
+- Segmentation can misclassify road/sidewalk/object regions.
+- The detector can miss small, distant, or occluded objects.
+- Fixed-angle compositing assumes directional images are evenly spaced.
+- Results should be evaluated qualitatively, not as a precise map.
 
-## How to run (Google Colab)
-
-1. Upload or clone this repo to your Colab runtime / Drive.
-2. Open `final-project-cse5509-v2.ipynb`.
-3. The notebook attempts optional Drive mount if Colab is detected.
-4. Ensure the discovered `data/` path is correct in the config output.
-5. Run cells top-to-bottom.
-
----
-
-## Key assumptions and limitations
-
-- **Monocular depth scale ambiguity:** metric distances are approximate.
-- **Approximate intrinsics:** focal length derived from assumed horizontal FOV.
-- **Ground-plane simplification:** uneven terrain and slopes can degrade BEV accuracy.
-- **Detection availability:** if torchvision models are unavailable, the pipeline falls back gracefully and records warnings.
-- **Compositing simplification:** stitched 360° BEV currently uses fixed-angle alpha blending; optional feature-based alignment diagnostics can be added later.
-
-This project intentionally avoids overclaiming physical metric precision.
-
----
-
-## Reproducibility and sanity checks
-The notebook includes checks for:
-- image existence and loadability
-- segmentation/depth shape compatibility
-- BEV output shape and save success
-- unique per-image instance labels
-- empty-safe detection handling
-- automatic output directory creation
-
----
-
-## AI usage note (placeholder)
-Add your course-required disclosure here, for example:
-
-> Portions of code structure and documentation were assisted by AI tools, then reviewed and validated by the student authors.
-
+## AI Usage
+AI tools were used to help refactor code and polish documentation. The final implementation, outputs, and limitations were reviewed by the project members.
