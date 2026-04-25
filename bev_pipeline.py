@@ -1,19 +1,14 @@
-"""Utilities for the CSE 5509 BEV final project.
+"""Helper functions for the CSE 5509 BEV final project.
 
-This module keeps the notebook readable and centralizes:
-- dataset discovery
-- segmentation/depth/detection inference helpers
-- BEV projection with an approximate pinhole model
-- visualization and output persistence
-
-The geometry is intentionally approximate because monocular depth has scale ambiguity.
+The code loads the dataset, runs pretrained vision models, projects results
+into an approximate BEV canvas, and saves visualizations used in the report.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence
 import importlib.util
 import json
 import math
@@ -60,7 +55,10 @@ MOVABLE_CLASS_NAMES = {
 
 
 def module_available(name: str) -> bool:
-    return importlib.util.find_spec(name) is not None
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def in_colab() -> bool:
@@ -137,7 +135,7 @@ def init_segmentation_model(device: str = "cpu") -> Dict[str, Any]:
     model = SegformerForSemanticSegmentation.from_pretrained(model_name)
     model.to(device)
     model.eval()
-    return {"available": True, "processor": processor, "model": model, "id2label": model.config.id2label}
+    return {"available": True, "processor": processor, "model": model, "id2label": model.config.id2label, "device": device}
 
 
 def init_depth_model(device: str = "cpu") -> Dict[str, Any]:
@@ -163,7 +161,7 @@ def init_instance_detector(device: str = "cpu") -> Dict[str, Any]:
     model.to(device)
     model.eval()
     preprocess = weights.transforms()
-    return {"available": True, "model": model, "preprocess": preprocess}
+    return {"available": True, "model": model, "preprocess": preprocess, "device": device}
 
 
 def infer_segmentation(image, seg_state: Dict[str, Any]):
@@ -187,9 +185,11 @@ def infer_segmentation(image, seg_state: Dict[str, Any]):
     processor = seg_state["processor"]
     model = seg_state["model"]
     id2label = seg_state["id2label"]
+    device = seg_state.get("device", "cpu")
 
     with torch.no_grad():
         inputs = processor(images=image, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         logits = model(**inputs).logits
         logits = F.interpolate(logits, size=(image.size[1], image.size[0]), mode="bilinear", align_corners=False)
         label_map = logits.argmax(dim=1)[0].cpu().numpy()
@@ -229,7 +229,7 @@ def infer_depth(image, depth_state: Dict[str, Any]):
 
         depth_np = np.array(Image.fromarray(depth_np).resize((w, h)))
 
-    # normalize to [0,1], larger means farther for our projection convention
+    # Normalize per image so depth can be mapped into a fixed BEV distance range.
     mn, mx = float(depth_np.min()), float(depth_np.max())
     if mx - mn < 1e-6:
         depth_norm = np.zeros_like(depth_np, dtype=np.float32)
@@ -284,8 +284,9 @@ def infer_instances(image, detector_state: Dict[str, Any], threshold: float = 0.
 
     model = detector_state["model"]
     preprocess = detector_state["preprocess"]
+    device = detector_state.get("device", "cpu")
 
-    tensor = preprocess(image).unsqueeze(0)
+    tensor = preprocess(image).unsqueeze(0).to(device)
     with torch.no_grad():
         pred = model(tensor)[0]
 
@@ -303,6 +304,7 @@ def infer_instances(image, detector_state: Dict[str, Any], threshold: float = 0.
 
         x1, y1, x2, y2 = bbox
         center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        # Bottom-center of the box is a simple ground contact proxy.
         contact = ((x1 + x2) / 2.0, y2)
         instances.append(
             {
@@ -398,6 +400,7 @@ def draw_bev_guides(bev, ego_x: int, ego_y: int, cfg: PipelineConfig) -> None:
         return
     import cv2
 
+    # OpenCV draws onto an RGB array here; colors are specified as RGB tuples.
     cv2.circle(bev, (ego_x, ego_y), 8, (255, 255, 255), -1)
     cv2.arrowedLine(bev, (ego_x, ego_y), (ego_x, max(5, ego_y - 70)), (255, 255, 0), 2, tipLength=0.2)
 
@@ -432,7 +435,7 @@ def add_instance_markers(bev_result: Dict[str, Any], instances: List[Dict[str, A
         inst["bev_xy"] = (bev_x, bev_y)
 
         if 0 <= bev_x < cfg.bev_width_px and 0 <= bev_y < cfg.bev_height_px:
-            cv2.circle(bev, (bev_x, bev_y), 5, (20, 20, 235), -1)
+            cv2.circle(bev, (bev_x, bev_y), 5, (235, 50, 50), -1)
             cv2.putText(bev, inst["instance_label"], (bev_x + 6, bev_y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
         records.append(
@@ -459,9 +462,10 @@ def draw_detection_overlay(image, instances: Sequence[Dict[str, Any]]):
         return arr
 
     import cv2
+    # OpenCV draws onto an RGB array here; colors are specified as RGB tuples.
     for inst in instances:
         x1, y1, x2, y2 = [int(v) for v in inst["bbox"]]
-        cv2.rectangle(arr, (x1, y1), (x2, y2), (0, 220, 255), 2)
+        cv2.rectangle(arr, (x1, y1), (x2, y2), (255, 200, 0), 2)
         cv2.putText(
             arr,
             f"{inst['instance_label']} {inst['confidence']:.2f}",
@@ -474,6 +478,17 @@ def draw_detection_overlay(image, instances: Sequence[Dict[str, Any]]):
     return arr
 
 
+def _extract_direction_index(label: str):
+    parts = label.lower().replace("_", " ").split()
+    for i, token in enumerate(parts[:-1]):
+        if token == "direction":
+            try:
+                return int(parts[i + 1])
+            except ValueError:
+                return None
+    return None
+
+
 def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: PipelineConfig):
     import numpy as np
 
@@ -481,15 +496,32 @@ def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: Pipel
         raise ValueError("No BEV images provided for stitching")
 
     canvas = np.zeros_like(bev_images[0], dtype=np.float32)
-    weight = np.zeros(bev_images[0].shape[:2], dtype=np.float32)
     step = 360.0 / max(1, len(bev_images))
 
     diagnostics = []
     for idx, bev in enumerate(bev_images):
+        direction_idx = _extract_direction_index(labels[idx])
+        rotation_deg = direction_idx * step if direction_idx is not None else idx * step
+        rotated = bev
+        if module_available("cv2"):
+            import cv2
+
+            h, w = bev.shape[:2]
+            center = (w / 2.0, h / 2.0)
+            matrix = cv2.getRotationMatrix2D(center, rotation_deg, 1.0)
+            rotated = cv2.warpAffine(
+                bev.astype(np.uint8),
+                matrix,
+                (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+
+        # This is approximate compositing, not true geometry-based stitching.
         alpha = 0.65
-        canvas = canvas * (1.0 - alpha) + bev.astype(np.float32) * alpha
-        weight = np.clip(weight + alpha, 0.0, 1.0)
-        diagnostics.append({"view": labels[idx], "rotation_deg": round(idx * step, 1), "alpha": alpha})
+        canvas = canvas * (1.0 - alpha) + rotated.astype(np.float32) * alpha
+        diagnostics.append({"view": labels[idx], "rotation_deg": round(rotation_deg, 1), "alpha": alpha})
 
     if module_available("cv2") and cfg.use_homography_diagnostics and len(bev_images) > 1:
         diagnostics.extend(compute_alignment_diagnostics(bev_images, labels))
