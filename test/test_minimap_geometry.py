@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bev_pipeline import (
     PipelineConfig,
+    _post_process_grounding_dino,
     assign_instance_labels,
     compute_alignment_diagnostics,
     compose_location_bev,
@@ -13,6 +14,7 @@ from bev_pipeline import (
     extract_direction_index,
     heading_for_direction,
     normalized_depth_to_distance,
+    normalize_class_name,
     resolve_project_paths,
     render_location_minimap,
     run_pipeline,
@@ -257,3 +259,63 @@ def test_small_demo_one_full_location(tmp_path: Path) -> None:
         bev_pipeline.process_location = original
 
     assert calls == [("loc1", 3)]
+
+
+def test_grounding_dino_postprocess_accepts_box_threshold_api() -> None:
+    class FakeProcessor:
+        def post_process_grounded_object_detection(
+            self,
+            outputs,
+            input_ids,
+            box_threshold,
+            text_threshold,
+            target_sizes,
+        ):
+            assert box_threshold == 0.35
+            assert text_threshold == 0.30
+            assert target_sizes == [(60, 80)]
+            return [{"scores": [0.91], "boxes": [[1, 2, 3, 4]], "labels": ["car"]}]
+
+    class FakeImage:
+        width = 80
+        height = 60
+
+    cfg = _cfg()
+    post = _post_process_grounding_dino(FakeProcessor(), outputs={}, input_ids=[1, 2], cfg=cfg, image=FakeImage())
+    assert post["labels"] == ["car"]
+
+
+def test_grounding_dino_postprocess_accepts_threshold_api() -> None:
+    class FakeProcessor:
+        def post_process_grounded_object_detection(
+            self,
+            outputs,
+            input_ids=None,
+            threshold=None,
+            text_threshold=None,
+            target_sizes=None,
+            box_threshold=None,
+        ):
+            if box_threshold is not None:
+                raise TypeError("unexpected keyword argument 'box_threshold'")
+            assert threshold == 0.35
+            assert text_threshold == 0.30
+            assert target_sizes == [(100, 200)]
+            assert input_ids == [42]
+            return [{"scores": [0.88], "boxes": [[10, 20, 30, 40]], "text_labels": ["a car"]}]
+
+    class FakeImage:
+        width = 200
+        height = 100
+
+    cfg = _cfg()
+    post = _post_process_grounding_dino(FakeProcessor(), outputs={}, input_ids=[42], cfg=cfg, image=FakeImage())
+    assert post["text_labels"] == ["a car"]
+
+
+def test_normalize_class_name_zero_shot_variants() -> None:
+    assert normalize_class_name("road sign.") == "road_sign"
+    assert normalize_class_name("traffic sign") == "road_sign"
+    assert normalize_class_name("stop sign") == "road_sign"
+    assert normalize_class_name("trash dumpster") == "dumpster"
+    assert normalize_class_name("a car") == "car"
