@@ -22,7 +22,7 @@ The pipeline uses this known capture convention directly instead of trying to es
 The pipeline intentionally combines multiple CSE 5509-relevant computer vision tasks:
 1. **Pretrained semantic segmentation (SegFormer)** for scene structure and ground/object diagnostics.
 2. **Pretrained monocular depth estimation (DPT)** for approximate distance cues.
-3. **Pretrained object detection (Mask R-CNN)** for object categories and bounding boxes.
+3. **Pretrained object detection (Mask R-CNN + optional Grounding DINO)** for object categories and bounding boxes.
 4. **Geometric minimap projection** using assumed horizontal FOV + contact-point depth + known direction headings.
 
 ## Dataset Format
@@ -79,6 +79,16 @@ Open `final-project-cse5509-v2.ipynb` and run cells top-to-bottom.
 
 The notebook uses `PROJECT_DIR` and `resolve_project_paths(...)` so the same workflow works for local and Colab usage with minimal manual edits.
 
+## Current Default Configuration Highlights
+- Detection confidence threshold defaults to **0.75**.
+- Minimap confidence filter defaults to **0.75**.
+- Primary target classes are: `person`, `car`, `bus`, `motorcycle`, `bicycle`, `dumpster`, `road_sign`.
+- Optional zero-shot detector uses `IDEA-Research/grounding-dino-tiny` to improve `dumpster` / `road_sign` coverage.
+- DPT depth normalization is interpreted as inverse-depth by default (higher normalized value = nearer).
+- Location-level deduplication uses class-aware NMS-style radius suppression in ego-meter coordinates.
+- Minimap/BEV canvas defaults are larger for readability (bigger labels, clearer legend).
+- Small demo mode now means **first N locations** and can include **all images** in those locations when `demo_images_per_location=None`.
+
 ## Main Outputs
 - **Primary final output (per location)**:
   - `outputs/per_location/loc1_minimap.png`
@@ -100,7 +110,7 @@ The notebook uses `PROJECT_DIR` and `resolve_project_paths(...)` so the same wor
 - Ego/player marker is at the image center.
 - `dir0` arrow points forward/reference direction.
 - Rings indicate approximate distance (e.g., 5m, 10m, 20m, 30m, 40m).
-- Marker colors indicate object class (person, car, truck, bus, bicycle, motorcycle).
+- Marker colors indicate object class (person, car, bus, motorcycle, bicycle, dumpster, road_sign).
 - Labels (e.g., `car1`, `person2`) are shown for the most readable subset.
 
 ## Intermediate Diagnostics
@@ -112,9 +122,11 @@ The project keeps intermediate outputs so TAs can inspect failure modes:
 
 ## Assumptions and Limitations
 - Monocular depth is not true calibrated metric distance.
+- Open-vocabulary detection can hallucinate or miss objects.
 - Camera intrinsics are approximated from image width + assumed horizontal FOV.
 - Bounding-box bottom center is only an approximate ground-contact estimate.
 - Adjacent direction views overlap, so repeated detections can occur.
+- Deduplication is heuristic because this project does not use calibrated multi-view 3D reconstruction.
 - Dense rows of cars/bicycles can yield many close detections, potentially cluttering the minimap.
 - The minimap is best interpreted qualitatively.
 

@@ -6,12 +6,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bev_pipeline import (
     PipelineConfig,
     assign_instance_labels,
+    compute_alignment_diagnostics,
     compose_location_bev,
+    deduplicate_location_rows,
     ego_meters_to_minimap_px,
     extract_direction_index,
     heading_for_direction,
+    normalized_depth_to_distance,
     resolve_project_paths,
     render_location_minimap,
+    run_pipeline,
     rotate_camera_relative_to_ego,
 )
 
@@ -172,3 +176,84 @@ def test_resolve_project_paths_uses_repo_data_dir_only(tmp_path: Path) -> None:
     assert paths["repo_root"] == resolved_tmp
     assert paths["data_dir"] == resolved_tmp / "data"
     assert paths["output_dir"] == resolved_tmp / "outputs"
+
+
+def test_depth_inverse_mapping() -> None:
+    import numpy as np
+
+    d = normalized_depth_to_distance(np.array([0.0, 1.0]), 2.0, 40.0, inverse=True)
+    assert np.allclose(d, np.array([40.0, 2.0]), atol=1e-4)
+
+
+def test_dedup_keeps_highest_confidence() -> None:
+    cfg = _cfg()
+    rows = [
+        {"class_name": "car", "confidence": 0.80, "ego_x_m": 0.0, "ego_y_m": 0.0, "instance_label": "car_old", "detector_source": "a"},
+        {"class_name": "car", "confidence": 0.95, "ego_x_m": 0.2, "ego_y_m": 0.0, "instance_label": "car_new", "detector_source": "b"},
+    ]
+    kept, _ = deduplicate_location_rows(rows, cfg)
+    assert len(kept) == 1
+    assert kept[0]["confidence"] == 0.95
+
+
+def test_dedup_does_not_merge_different_classes() -> None:
+    cfg = _cfg()
+    rows = [
+        {"class_name": "car", "confidence": 0.9, "ego_x_m": 0.0, "ego_y_m": 0.0, "instance_label": "car1", "detector_source": "a"},
+        {"class_name": "bus", "confidence": 0.85, "ego_x_m": 0.0, "ego_y_m": 0.0, "instance_label": "bus1", "detector_source": "b"},
+    ]
+    kept, _ = deduplicate_location_rows(rows, cfg)
+    assert len(kept) == 2
+
+
+def test_alignment_diagnostics_accepts_rgb_images() -> None:
+    import importlib.util
+    if importlib.util.find_spec('numpy') is None:
+        return
+    import numpy as np
+    images = [np.zeros((20, 20, 3), dtype=np.uint8), np.zeros((20, 20, 3), dtype=np.uint8)]
+    diag = compute_alignment_diagnostics(images, ["direction 0", "direction 1"])
+    assert len(diag) >= 1
+    assert "status" in diag[0]
+
+
+def test_small_demo_one_full_location(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    loc1 = data_dir / "loc1"
+    loc2 = data_dir / "loc2"
+    loc1.mkdir(parents=True)
+    loc2.mkdir(parents=True)
+    for i in range(3):
+        (loc1 / f"direction {i}.jpg").write_bytes(b"x")
+    for i in range(2):
+        (loc2 / f"direction {i}.jpg").write_bytes(b"x")
+
+    summary = {
+        "locations": ["loc1", "loc2"],
+        "files": {"loc1": [loc1 / f"direction {i}.jpg" for i in range(3)], "loc2": [loc2 / f"direction {i}.jpg" for i in range(2)]},
+    }
+    cfg = PipelineConfig(
+        repo_root=tmp_path,
+        data_dir=data_dir,
+        output_dir=tmp_path / "outputs",
+        run_small_demo=True,
+        demo_locations=1,
+        demo_images_per_location=None,
+    )
+
+    import bev_pipeline
+
+    calls = []
+
+    def fake_process_location(location_name, image_paths, cfg, model_states, output_dirs):
+        calls.append((location_name, len(image_paths)))
+        return {"num_images": len(image_paths), "images": [], "rows": []}
+
+    original = bev_pipeline.process_location
+    bev_pipeline.process_location = fake_process_location
+    try:
+        run_pipeline(cfg, summary, {"seg": {}, "depth": {}, "det": {}, "det_zero_shot": {}})
+    finally:
+        bev_pipeline.process_location = original
+
+    assert calls == [("loc1", 3)]

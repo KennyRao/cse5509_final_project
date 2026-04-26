@@ -22,34 +22,41 @@ class PipelineConfig:
     repo_root: Path
     data_dir: Path
     output_dir: Path
-    run_small_demo: bool = True
+    run_small_demo: bool = False
     demo_locations: int = 1
-    demo_images_per_location: int = 2
+    demo_images_per_location: Optional[int] = None
     clean_output_dir: bool = False
 
     # Geometric / depth assumptions.
-    horizontal_fov_deg: float = 70.0
+    # Xiaomi 13 main camera is ~23mm equivalent; ~76° horizontal FOV is a
+    # practical starting point for 1x captures. Ultra-wide shots need larger FOV.
+    horizontal_fov_deg: float = 76.0
     min_depth_m: float = 2.0
     max_depth_m: float = 40.0
+    depth_is_inverse: bool = True
 
     # Legacy per-image BEV diagnostic settings.
     bev_max_distance_m: float = 40.0
-    bev_scale_px_per_m: float = 12.0
-    bev_height_px: int = 720
-    bev_width_px: int = 720
+    bev_scale_px_per_m: float = 18.0
+    bev_height_px: int = 1100
+    bev_width_px: int = 1100
 
     # Minimap settings (primary output).
-    minimap_size_px: int = 900
+    minimap_size_px: int = 1400
     minimap_max_distance_m: float = 40.0
     minimap_scale_px_per_m: Optional[float] = None
     minimap_draw_dense_points: bool = True
     minimap_draw_object_labels: bool = True
-    minimap_min_confidence: float = 0.5
-    minimap_label_top_k_per_location: int = 30
+    minimap_min_confidence: float = 0.75
+    minimap_label_top_k_per_location: int = 60
     minimap_marker_alpha: float = 0.85
     minimap_jitter_overlapping_markers: bool = True
-    minimap_merge_nearby_same_class: bool = False
-    minimap_merge_radius_m: float = 1.0
+    minimap_merge_nearby_same_class: bool = True
+    minimap_merge_radius_m: float = 1.5
+    minimap_merge_radius_by_class: Optional[Dict[str, float]] = None
+
+    stitched_draw_dense_points: bool = True
+    stitched_dense_alpha: float = 0.45
 
     # Direction convention.
     # heading_deg is clockwise degrees from +y (north/forward).
@@ -57,8 +64,12 @@ class PipelineConfig:
     direction_step_deg: float = 45.0
     direction_turn: str = "right"
 
-    detection_threshold: float = 0.5
+    detection_threshold: float = 0.75
     use_homography_diagnostics: bool = True
+    use_zero_shot_detector: bool = True
+    zero_shot_model_name: str = "IDEA-Research/grounding-dino-tiny"
+    zero_shot_box_threshold: float = 0.35
+    zero_shot_text_threshold: float = 0.30
 
 
 COCO_ID_TO_NAME = {
@@ -68,6 +79,8 @@ COCO_ID_TO_NAME = {
     4: "motorcycle",
     6: "bus",
     8: "truck",
+    10: "traffic light",
+    13: "stop sign",
 }
 
 CLASS_COLORS = {
@@ -77,6 +90,8 @@ CLASS_COLORS = {
     "motorcycle": (184, 143, 255),
     "bus": (255, 136, 52),
     "truck": (120, 232, 168),
+    "dumpster": (166, 149, 121),
+    "road_sign": (255, 230, 130),
 }
 
 GROUND_CLASS_NAMES = {"road", "sidewalk", "terrain"}
@@ -90,12 +105,51 @@ MOVABLE_CLASS_NAMES = {
     "bicycle",
 }
 
+TARGET_CLASS_NAMES = {"person", "car", "bus", "motorcycle", "bicycle", "dumpster", "road_sign"}
+ZERO_SHOT_LABEL_PROMPTS = [
+    "person",
+    "car",
+    "bus",
+    "motorcycle",
+    "bicycle",
+    "dumpster",
+    "trash dumpster",
+    "road sign",
+    "traffic sign",
+    "stop sign",
+]
+ZERO_SHOT_CLASS_ALIASES = {
+    "trash dumpster": "dumpster",
+    "road sign": "road_sign",
+    "traffic sign": "road_sign",
+    "stop sign": "road_sign",
+    "traffic light": "road_sign",
+}
+DEDUP_RADIUS_BY_CLASS_DEFAULT = {
+    "person": 0.8,
+    "bicycle": 1.2,
+    "motorcycle": 1.2,
+    "car": 2.0,
+    "bus": 3.0,
+    "dumpster": 2.0,
+    "road_sign": 1.5,
+}
+
 
 def module_available(name: str) -> bool:
     try:
         return importlib.util.find_spec(name) is not None
     except ModuleNotFoundError:
         return False
+
+
+def get_cv2():
+    try:
+        import cv2
+
+        return cv2
+    except Exception:
+        return None
 
 
 def in_colab() -> bool:
@@ -220,7 +274,26 @@ def init_instance_detector(device: str = "cpu") -> Dict[str, Any]:
     model.to(device)
     model.eval()
     preprocess = weights.transforms()
-    return {"available": True, "model": model, "preprocess": preprocess, "device": device}
+    categories = list(weights.meta.get("categories", []))
+    return {"available": True, "model": model, "preprocess": preprocess, "device": device, "categories": categories}
+
+
+def init_zero_shot_detector(cfg: PipelineConfig, device: str = "cpu") -> Dict[str, Any]:
+    if not cfg.use_zero_shot_detector:
+        return {"available": False, "reason": "disabled by config"}
+    if not module_available("transformers") or not module_available("torch"):
+        return {"available": False, "reason": "transformers/torch not installed"}
+    try:
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(cfg.zero_shot_model_name)
+        model = AutoModelForZeroShotObjectDetection.from_pretrained(cfg.zero_shot_model_name)
+        model.to(device)
+        model.eval()
+    except Exception as exc:
+        print(f"[WARN] Zero-shot detector unavailable ({cfg.zero_shot_model_name}): {exc}. Falling back to Mask R-CNN only.")
+        return {"available": False, "reason": str(exc)}
+    return {"available": True, "processor": processor, "model": model, "device": device}
 
 
 def infer_segmentation(image, seg_state: Dict[str, Any]):
@@ -299,8 +372,8 @@ def infer_depth(image, depth_state: Dict[str, Any]):
 def cleanup_masks(ground_mask, object_mask):
     import numpy as np
 
-    if module_available("cv2"):
-        import cv2
+    cv2 = get_cv2()
+    if cv2 is not None:
 
         g = ground_mask.astype("uint8")
         o = object_mask.astype("uint8")
@@ -321,9 +394,9 @@ def cleanup_masks(ground_mask, object_mask):
 def remove_small_components(mask, min_size: int = 100):
     import numpy as np
 
-    if not module_available("cv2"):
+    cv2 = get_cv2()
+    if cv2 is None:
         return mask
-    import cv2
 
     out = np.zeros_like(mask, dtype=bool)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype("uint8"), connectivity=8)
@@ -333,9 +406,44 @@ def remove_small_components(mask, min_size: int = 100):
     return out
 
 
-def infer_instances(image, detector_state: Dict[str, Any], threshold: float = 0.5) -> Dict[str, Any]:
+def normalize_class_name(class_name: str) -> str:
+    key = class_name.strip().lower().replace("-", " ").replace("_", " ")
+    return ZERO_SHOT_CLASS_ALIASES.get(key, key.replace(" ", "_"))
+
+
+def _instance_iou_xyxy(a: Sequence[float], b: Sequence[float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    denom = max(area_a + area_b - inter, 1e-8)
+    return inter / denom
+
+
+def _dedup_image_space_instances(instances: Sequence[Dict[str, Any]], iou_threshold: float = 0.5) -> List[Dict[str, Any]]:
+    kept: List[Dict[str, Any]] = []
+    for candidate in sorted(instances, key=lambda i: -float(i["confidence"])):
+        suppress = False
+        for existing in kept:
+            if normalize_class_name(candidate["class_name"]) != normalize_class_name(existing["class_name"]):
+                continue
+            if _instance_iou_xyxy(candidate["bbox"], existing["bbox"]) >= iou_threshold:
+                suppress = True
+                break
+        if not suppress:
+            kept.append(candidate)
+    return kept
+
+
+def _infer_instances_maskrcnn(image, detector_state: Dict[str, Any], threshold: float = 0.5) -> List[Dict[str, Any]]:
     if not detector_state.get("available", False):
-        return {"instances": [], "warning": detector_state.get("reason", "detector unavailable")}
+        return []
 
     import torch
 
@@ -360,13 +468,70 @@ def infer_instances(image, detector_state: Dict[str, Any], threshold: float = 0.
         contact = ((x1 + x2) / 2.0, y2)
         instances.append(
             {
-                "class_name": COCO_ID_TO_NAME[label_id],
+                "class_name": normalize_class_name(COCO_ID_TO_NAME[label_id]),
                 "confidence": score,
                 "bbox": bbox,
                 "center_xy": center,
                 "contact_xy": contact,
+                "detector_source": "mask_rcnn",
             }
         )
+    return [i for i in instances if i["class_name"] in TARGET_CLASS_NAMES or i["class_name"] == "truck"]
+
+
+def _infer_instances_zero_shot(image, zero_shot_state: Dict[str, Any], cfg: PipelineConfig) -> List[Dict[str, Any]]:
+    if not zero_shot_state.get("available", False):
+        return []
+    import torch
+
+    processor = zero_shot_state["processor"]
+    model = zero_shot_state["model"]
+    device = zero_shot_state.get("device", "cpu")
+    inputs = processor(images=image, text=ZERO_SHOT_LABEL_PROMPTS, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    target_sizes = torch.tensor([[image.size[1], image.size[0]]], device=device)
+    post = processor.post_process_grounded_object_detection(
+        outputs,
+        inputs.input_ids,
+        box_threshold=cfg.zero_shot_box_threshold,
+        text_threshold=cfg.zero_shot_text_threshold,
+        target_sizes=target_sizes,
+    )[0]
+    instances: List[Dict[str, Any]] = []
+    for score, box, label in zip(post.get("scores", []), post.get("boxes", []), post.get("labels", [])):
+        cls = normalize_class_name(str(label))
+        if cls not in TARGET_CLASS_NAMES:
+            continue
+        bbox = [float(v) for v in box.tolist()]
+        x1, y1, x2, y2 = bbox
+        instances.append(
+            {
+                "class_name": cls,
+                "confidence": float(score),
+                "bbox": bbox,
+                "center_xy": [(x1 + x2) / 2.0, (y1 + y2) / 2.0],
+                "contact_xy": [(x1 + x2) / 2.0, y2],
+                "detector_source": "grounding_dino",
+            }
+        )
+    return instances
+
+
+def infer_instances(
+    image,
+    detector_state: Dict[str, Any],
+    zero_shot_state: Optional[Dict[str, Any]] = None,
+    cfg: Optional[PipelineConfig] = None,
+    threshold: float = 0.5,
+) -> Dict[str, Any]:
+    if cfg is None:
+        raise ValueError("infer_instances requires cfg")
+    if not detector_state.get("available", False) and not (zero_shot_state or {}).get("available", False):
+        return {"instances": [], "warning": detector_state.get("reason", "detector unavailable")}
+    instances = _infer_instances_maskrcnn(image, detector_state, threshold=threshold)
+    instances.extend(_infer_instances_zero_shot(image, zero_shot_state or {}, cfg))
+    instances = _dedup_image_space_instances(instances, iou_threshold=0.5)
 
     instances = assign_instance_labels(instances)
     return {"instances": instances}
@@ -398,11 +563,12 @@ def get_intrinsics(width: int, height: int, hfov_deg: float) -> Dict[str, float]
     return {"fx": fx, "fy": fy, "cx": width / 2.0, "cy": height / 2.0}
 
 
-def normalized_depth_to_distance(depth_norm, depth_min: float, depth_max: float):
+def normalized_depth_to_distance(depth_norm, depth_min: float, depth_max: float, inverse: bool = True):
     import numpy as np
 
     depth_norm = np.clip(depth_norm, 0.0, 1.0)
-    return depth_min + (depth_max - depth_min) * depth_norm
+    distance_norm = 1.0 - depth_norm if inverse else depth_norm
+    return depth_min + (depth_max - depth_min) * distance_norm
 
 
 def build_bev(seg_result: Dict[str, Any], depth_result: Dict[str, Any], cfg: PipelineConfig):
@@ -416,7 +582,7 @@ def build_bev(seg_result: Dict[str, Any], depth_result: Dict[str, Any], cfg: Pip
 
     h, w = depth.shape
     intr = get_intrinsics(w, h, cfg.horizontal_fov_deg)
-    dist = normalized_depth_to_distance(depth, cfg.min_depth_m, cfg.max_depth_m)
+    dist = normalized_depth_to_distance(depth, cfg.min_depth_m, cfg.max_depth_m, inverse=cfg.depth_is_inverse)
 
     bev = np.zeros((cfg.bev_height_px, cfg.bev_width_px, 3), dtype=np.uint8)
     ego_x = cfg.bev_width_px // 2
@@ -439,9 +605,9 @@ def build_bev(seg_result: Dict[str, Any], depth_result: Dict[str, Any], cfg: Pip
 
 
 def draw_bev_guides(bev, ego_x: int, ego_y: int, cfg: PipelineConfig) -> None:
-    if not module_available("cv2"):
+    cv2 = get_cv2()
+    if cv2 is None:
         return
-    import cv2
 
     cv2.circle(bev, (ego_x, ego_y), 8, (255, 255, 255), -1)
     cv2.arrowedLine(bev, (ego_x, ego_y), (ego_x, max(5, ego_y - 70)), (255, 255, 0), 2, tipLength=0.2)
@@ -459,9 +625,9 @@ def add_instance_markers(bev_result: Dict[str, Any], instances: List[Dict[str, A
     ego_x, ego_y = bev_result["ego_xy"]
     intr = get_intrinsics(depth_m.shape[1], depth_m.shape[0], cfg.horizontal_fov_deg)
 
-    if not module_available("cv2"):
+    cv2 = get_cv2()
+    if cv2 is None:
         return bev, []
-    import cv2
 
     records = []
     for inst in instances:
@@ -484,6 +650,7 @@ def add_instance_markers(bev_result: Dict[str, Any], instances: List[Dict[str, A
             {
                 "instance_label": inst["instance_label"],
                 "class_name": inst["class_name"],
+                "detector_source": inst.get("detector_source", "unknown"),
                 "confidence": round(float(inst["confidence"]), 4),
                 "bbox": [round(v, 2) for v in inst["bbox"]],
                 "center_xy": [round(v, 2) for v in inst["center_xy"]],
@@ -500,10 +667,9 @@ def draw_detection_overlay(image, instances: Sequence[Dict[str, Any]]):
     import numpy as np
 
     arr = np.array(image).copy()
-    if not module_available("cv2"):
+    cv2 = get_cv2()
+    if cv2 is None:
         return arr
-
-    import cv2
 
     for inst in instances:
         x1, y1, x2, y2 = [int(v) for v in inst["bbox"]]
@@ -573,9 +739,9 @@ def ego_meters_to_minimap_px(x_m: float, y_m: float, cfg: PipelineConfig) -> Tup
 
 
 def draw_minimap_guides(canvas, cfg: PipelineConfig) -> None:
-    if not module_available("cv2"):
+    cv2 = get_cv2()
+    if cv2 is None:
         return
-    import cv2
 
     c = cfg.minimap_size_px // 2
     scale = minimap_scale_px_per_m(cfg)
@@ -600,26 +766,26 @@ def draw_minimap_guides(canvas, cfg: PipelineConfig) -> None:
 
 
 def draw_stitched_bev_guides(canvas, center_px: int, scale_px_per_m: float, max_distance_m: float, cfg: PipelineConfig) -> None:
-    if not module_available("cv2"):
+    cv2 = get_cv2()
+    if cv2 is None:
         return
-    import cv2
 
     cv2.circle(canvas, (center_px, center_px), 6, (255, 255, 255), -1)
-    cv2.arrowedLine(canvas, (center_px, center_px), (center_px, int(round(center_px - 0.22 * canvas.shape[0]))), (0, 255, 255), 2, tipLength=0.2)
+    cv2.arrowedLine(canvas, (center_px, center_px), (center_px, int(round(center_px - 0.22 * canvas.shape[0]))), (0, 190, 190), 1, tipLength=0.2)
     cv2.putText(canvas, "dir0", (center_px + 6, int(round(center_px - 0.24 * canvas.shape[0]))), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1)
 
     for meters in [5, 10, 20, 30, 40]:
         if meters > max_distance_m:
             continue
         radius = int(round(meters * scale_px_per_m))
-        cv2.circle(canvas, (center_px, center_px), radius, (70, 70, 70), 1)
+        cv2.circle(canvas, (center_px, center_px), radius, (58, 58, 58), 1)
 
     spoke_radius = int(round(max_distance_m * scale_px_per_m))
     for i in range(8):
         theta = math.radians(heading_for_direction(i, cfg))
         spoke_x = int(round(center_px + math.sin(theta) * spoke_radius))
         spoke_y = int(round(center_px - math.cos(theta) * spoke_radius))
-        cv2.line(canvas, (center_px, center_px), (spoke_x, spoke_y), (55, 55, 55), 1)
+        cv2.line(canvas, (center_px, center_px), (spoke_x, spoke_y), (45, 45, 45), 1)
         cv2.putText(canvas, f"dir{i}", (spoke_x - 14, spoke_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (165, 165, 165), 1)
 
 
@@ -637,40 +803,72 @@ def _bearing_deg(x_m: float, y_m: float) -> float:
     return (math.degrees(math.atan2(x_m, y_m)) + 360.0) % 360.0
 
 
-def _apply_optional_merge(rows: List[Dict[str, Any]], cfg: PipelineConfig) -> List[Dict[str, Any]]:
+def deduplicate_location_rows(rows: List[Dict[str, Any]], cfg: PipelineConfig) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     if not cfg.minimap_merge_nearby_same_class:
-        return rows
+        return rows, []
 
-    merged: List[Dict[str, Any]] = []
-    for row in sorted(rows, key=lambda r: -r["confidence"]):
-        found = False
-        for m in merged:
-            if row["class_name"] != m["class_name"]:
+    radius_by_class = dict(DEDUP_RADIUS_BY_CLASS_DEFAULT)
+    if cfg.minimap_merge_radius_by_class:
+        radius_by_class.update(cfg.minimap_merge_radius_by_class)
+
+    kept: List[Dict[str, Any]] = []
+    suppressed_records: List[Dict[str, Any]] = []
+    for row in sorted(rows, key=lambda r: -float(r["confidence"])):
+        cls = normalize_class_name(row["class_name"])
+        threshold_m = float(radius_by_class.get(cls, cfg.minimap_merge_radius_m))
+        suppressed = False
+        for existing in kept:
+            if normalize_class_name(existing["class_name"]) != cls:
                 continue
-            dist = math.hypot(row["ego_x_m"] - m["ego_x_m"], row["ego_y_m"] - m["ego_y_m"])
-            if dist <= cfg.minimap_merge_radius_m:
-                found = True
+            distance_m = float(math.hypot(row["ego_x_m"] - existing["ego_x_m"], row["ego_y_m"] - existing["ego_y_m"]))
+            if distance_m <= threshold_m:
+                suppressed = True
+                suppressed_records.append(
+                    {
+                        "class_name": cls,
+                        "distance_m": round(distance_m, 4),
+                        "threshold_m": round(threshold_m, 4),
+                        "kept_label": existing.get("instance_label"),
+                        "kept_source": existing.get("detector_source", "unknown"),
+                        "kept_confidence": float(existing.get("confidence", 0.0)),
+                        "suppressed_label": row.get("instance_label"),
+                        "suppressed_source": row.get("detector_source", "unknown"),
+                        "suppressed_confidence": float(row.get("confidence", 0.0)),
+                    }
+                )
                 break
-        if not found:
-            merged.append(row)
-    return merged
+        if not suppressed:
+            kept.append(row)
+    return kept, suppressed_records
+
+
+def relabel_instances_per_class(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(normalize_class_name(row["class_name"]), []).append(row)
+    updated: List[Dict[str, Any]] = []
+    for cls in sorted(grouped.keys()):
+        group = sorted(grouped[cls], key=lambda r: (r["bearing_deg"], r["source_image"], r["contact_xy"][0]))
+        for idx, row in enumerate(group, start=1):
+            row["class_name"] = cls
+            row["instance_label"] = f"{cls}{idx}"
+            updated.append(row)
+    return updated
 
 
 def render_location_minimap(location_name: str, rows: List[Dict[str, Any]], cfg: PipelineConfig, output_path: Path) -> Path:
     import numpy as np
 
-    if not module_available("cv2"):
+    cv2 = get_cv2()
+    if cv2 is None:
         canvas = np.zeros((cfg.minimap_size_px, cfg.minimap_size_px, 3), dtype=np.uint8)
         save_array_image(output_path, canvas)
         return output_path
-
-    import cv2
 
     canvas = np.zeros((cfg.minimap_size_px, cfg.minimap_size_px, 3), dtype=np.uint8)
     canvas[:] = (20, 20, 20)
     draw_minimap_guides(canvas, cfg)
 
-    rows = _apply_optional_merge(rows, cfg)
     rows_for_labels = sorted(rows, key=lambda r: (-r["confidence"], r["range_m"]))[: cfg.minimap_label_top_k_per_location]
     label_keys = {(r["source_image"], r["instance_label"]) for r in rows_for_labels}
 
@@ -682,8 +880,9 @@ def render_location_minimap(location_name: str, rows: List[Dict[str, Any]], cfg:
             n = occupancy.get(key, 0)
             if n > 0:
                 ang = n * 2.399963
-                x += int(round(5 * math.cos(ang)))
-                y += int(round(5 * math.sin(ang)))
+                jitter_px = max(8, int(round(cfg.minimap_size_px * 0.007)))
+                x += int(round(jitter_px * math.cos(ang)))
+                y += int(round(jitter_px * math.sin(ang)))
             occupancy[key] = n + 1
 
         color = CLASS_COLORS.get(row["class_name"], (220, 220, 220))
@@ -693,13 +892,17 @@ def render_location_minimap(location_name: str, rows: List[Dict[str, Any]], cfg:
         cv2.addWeighted(overlay, alpha, canvas, 1.0 - alpha, 0.0, dst=canvas)
 
         if cfg.minimap_draw_object_labels and (row["source_image"], row["instance_label"]) in label_keys:
-            cv2.putText(canvas, row["instance_label"], (x + 7, y - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (240, 240, 240), 1)
+            text = row["instance_label"]
+            tx, ty = x + 10, y - 8
+            (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)
+            cv2.rectangle(canvas, (tx - 3, ty - th - 3), (tx + tw + 3, ty + baseline + 2), (20, 20, 20), -1)
+            cv2.putText(canvas, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (240, 240, 240), 2)
 
     cv2.putText(canvas, f"{location_name} minimap (ego-centered)", (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-    legend_items = ["person", "car", "truck", "bus", "bicycle", "motorcycle"]
-    lx, ly = 20, cfg.minimap_size_px - 180
-    cv2.rectangle(canvas, (lx - 10, ly - 30), (lx + 260, ly + 145), (35, 35, 35), -1)
+    legend_items = ["person", "car", "bus", "motorcycle", "bicycle", "dumpster", "road_sign"]
+    lx, ly = 20, cfg.minimap_size_px - 220
+    cv2.rectangle(canvas, (lx - 10, ly - 30), (lx + 280, ly + 180), (35, 35, 35), -1)
     cv2.putText(canvas, "Legend", (lx, ly - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (245, 245, 245), 1)
     for i, name in enumerate(legend_items):
         y = ly + i * 23
@@ -717,6 +920,7 @@ def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "direction_index": row["direction_index"],
         "heading_deg": round(row["heading_deg"], 3),
         "class_name": row["class_name"],
+        "detector_source": row.get("detector_source", "unknown"),
         "instance_label": row["instance_label"],
         "confidence": round(row["confidence"], 4),
         "bbox": [round(v, 2) for v in row["bbox"]],
@@ -791,8 +995,17 @@ def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: Pipel
         out_y = out_y[in_bounds]
         src_pixels = bev_u8[ys[in_bounds], xs[in_bounds]].astype(np.float32)
 
-        np.add.at(accum, (out_y, out_x, slice(None)), src_pixels)
-        np.add.at(counts, (out_y, out_x), 1.0)
+        if not cfg.stitched_draw_dense_points:
+            src_mask = np.any(src_pixels > 20, axis=1)
+            out_x = out_x[src_mask]
+            out_y = out_y[src_mask]
+            src_pixels = src_pixels[src_mask]
+        if src_pixels.size == 0:
+            diagnostics.append({"view": labels[idx], "valid_pixels": int(ys.size), "painted_pixels": 0, "heading_deg": round(heading_deg, 1)})
+            continue
+
+        np.add.at(accum, (out_y, out_x, slice(None)), src_pixels * float(cfg.stitched_dense_alpha))
+        np.add.at(counts, (out_y, out_x), float(cfg.stitched_dense_alpha))
         diagnostics.append({
             "view": labels[idx],
             "heading_deg": round(heading_deg, 1),
@@ -806,14 +1019,13 @@ def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: Pipel
     stitched[painted] = np.clip(accum[painted] / counts[painted, None], 0, 255).astype(np.uint8)
     draw_stitched_bev_guides(stitched, center, output_scale, cfg.bev_max_distance_m, cfg)
 
-    if module_available("cv2") and cfg.use_homography_diagnostics and len(bev_images) > 1:
-        # ORB/H diagnostics are optional quality checks; stitching uses known headings.
-        diagnostics.extend(compute_alignment_diagnostics(bev_images, labels))
     return stitched, diagnostics
 
 
 def compute_alignment_diagnostics(images: Sequence, labels: Sequence[str]) -> List[Dict[str, Any]]:
-    import cv2
+    cv2 = get_cv2()
+    if cv2 is None:
+        return [{"status": "skipped_cv2_missing", "pair": "n/a", "matches": 0, "inliers": 0}]
     import numpy as np
 
     out: List[Dict[str, Any]] = []
@@ -822,12 +1034,20 @@ def compute_alignment_diagnostics(images: Sequence, labels: Sequence[str]) -> Li
 
     for i in range(len(images) - 1):
         a, b = images[i], images[i + 1]
-        g1 = cv2.cvtColor(a.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-        g2 = cv2.cvtColor(b.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        a_u8 = np.asarray(a).astype(np.uint8)
+        b_u8 = np.asarray(b).astype(np.uint8)
+        if a_u8.ndim == 3:
+            g1 = cv2.cvtColor(a_u8, cv2.COLOR_RGB2GRAY)
+        else:
+            g1 = a_u8
+        if b_u8.ndim == 3:
+            g2 = cv2.cvtColor(b_u8, cv2.COLOR_RGB2GRAY)
+        else:
+            g2 = b_u8
         k1, d1 = orb.detectAndCompute(g1, None)
         k2, d2 = orb.detectAndCompute(g2, None)
         if d1 is None or d2 is None or len(k1) < 4 or len(k2) < 4:
-            out.append({"pair": f"{labels[i]}->{labels[i+1]}", "matches": 0, "inliers": 0, "status": "fallback_fixed_angle"})
+            out.append({"pair": f"{labels[i]}->{labels[i+1]}", "matches": 0, "inliers": 0, "status": "fallback_fixed_angle", "diagnostic_source": "rgb_original"})
             continue
 
         matches = sorted(matcher.match(d1, d2), key=lambda m: m.distance)
@@ -835,7 +1055,15 @@ def compute_alignment_diagnostics(images: Sequence, labels: Sequence[str]) -> Li
         pts2 = np.float32([k2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
         H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, 5.0)
         inliers = int(mask.sum()) if mask is not None else 0
-        out.append({"pair": f"{labels[i]}->{labels[i+1]}", "matches": len(matches), "inliers": inliers, "status": "diagnostic_only" if H is not None else "fallback_fixed_angle"})
+        out.append(
+            {
+                "pair": f"{labels[i]}->{labels[i+1]}",
+                "matches": len(matches),
+                "inliers": inliers,
+                "status": "diagnostic_only" if H is not None else "fallback_fixed_angle",
+                "diagnostic_source": "rgb_original",
+            }
+        )
     return out
 
 
@@ -855,7 +1083,13 @@ def process_image(image_path: Path, cfg: PipelineConfig, model_states: Dict[str,
     image = load_rgb_image(image_path)
     seg = infer_segmentation(image, model_states["seg"])
     depth = infer_depth(image, model_states["depth"])
-    det = infer_instances(image, model_states["det"], threshold=cfg.detection_threshold)
+    det = infer_instances(
+        image,
+        model_states["det"],
+        zero_shot_state=model_states.get("det_zero_shot"),
+        cfg=cfg,
+        threshold=cfg.detection_threshold,
+    )
 
     instances = det["instances"]
     assert_unique_labels(instances)
@@ -882,7 +1116,7 @@ def process_image(image_path: Path, cfg: PipelineConfig, model_states: Dict[str,
     save_array_image(output_dirs["diagnostics"] / f"{loc}_{stem}_object_mask.png", obj_vis)
 
     h, w = image.size[1], image.size[0]
-    distance_m = normalized_depth_to_distance(depth["depth"], cfg.min_depth_m, cfg.max_depth_m)
+    distance_m = normalized_depth_to_distance(depth["depth"], cfg.min_depth_m, cfg.max_depth_m, inverse=cfg.depth_is_inverse)
     direction_index = extract_direction_index(image_path.name)
     if direction_index is None:
         direction_index = 0
@@ -919,7 +1153,8 @@ def process_image(image_path: Path, cfg: PipelineConfig, model_states: Dict[str,
             "location": loc,
             "direction_index": int(direction_index),
             "heading_deg": float(heading_deg),
-            "class_name": inst["class_name"],
+            "class_name": normalize_class_name(inst["class_name"]),
+            "detector_source": inst.get("detector_source", "unknown"),
             "instance_label": inst["instance_label"],
             "confidence": float(inst["confidence"]),
             "bbox": list(inst["bbox"]),
@@ -954,6 +1189,7 @@ def process_image(image_path: Path, cfg: PipelineConfig, model_states: Dict[str,
 def process_location(location_name: str, image_paths: Sequence[Path], cfg: PipelineConfig, model_states: Dict[str, Any], output_dirs: Dict[str, Path]):
     image_results = []
     bev_stack = []
+    rgb_stack = []
     labels = []
     loc_rows: List[Dict[str, Any]] = []
 
@@ -966,20 +1202,26 @@ def process_location(location_name: str, image_paths: Sequence[Path], cfg: Pipel
         import numpy as np
 
         bev_stack.append(np.array(Image.open(result["bev_path"]).convert("RGB")))
+        rgb_stack.append(np.array(Image.open(path).convert("RGB")))
         labels.append(path.stem)
 
+    dedup_rows, dedup_diag = deduplicate_location_rows(loc_rows, cfg)
+    dedup_rows = relabel_instances_per_class(dedup_rows)
+
     minimap_path = output_dirs["per_location"] / f"{location_name}_minimap.png"
-    render_location_minimap(location_name, loc_rows, cfg, minimap_path)
+    render_location_minimap(location_name, dedup_rows, cfg, minimap_path)
 
     direction_debug_path = output_dirs["diagnostics"] / f"{location_name}_direction_debug.png"
     render_direction_debug_plot(cfg, direction_debug_path)
 
     stitched, diagnostics = compose_location_bev(bev_stack, labels, cfg)
+    diagnostics.extend(compute_alignment_diagnostics(rgb_stack, labels))
     stitched_path = output_dirs["per_location"] / f"{location_name}_stitched_bev.png"
     save_array_image(stitched_path, stitched)
     save_json(output_dirs["tables"] / f"{location_name}_stitch_diagnostics.json", diagnostics)
+    save_json(output_dirs["tables"] / f"{location_name}_dedup_diagnostics.json", dedup_diag)
 
-    loc_json_rows = [_serialize_row(r) for r in loc_rows]
+    loc_json_rows = [_serialize_row(r) for r in dedup_rows]
     loc_json_path = output_dirs["tables"] / f"{location_name}_minimap_instances.json"
     loc_csv_path = output_dirs["tables"] / f"{location_name}_minimap_instances.csv"
     save_json(loc_json_path, loc_json_rows)
@@ -1003,7 +1245,9 @@ def process_location(location_name: str, image_paths: Sequence[Path], cfg: Pipel
         "stitched_bev": str(stitched_path),
         "minimap_instance_table_json": str(loc_json_path),
         "minimap_instance_table_csv": str(loc_csv_path),
-        "total_instances": len(loc_rows),
+        "rows": loc_json_rows,
+        "total_instances": len(dedup_rows),
+        "dedup_suppressed": len(dedup_diag),
     }
 
 
@@ -1019,11 +1263,11 @@ def run_pipeline(cfg: PipelineConfig, summary: Dict[str, Any], model_states: Dic
     for loc in location_names:
         image_paths = summary["files"][loc]
         if cfg.run_small_demo:
-            image_paths = image_paths[: cfg.demo_images_per_location]
+            if cfg.demo_images_per_location is not None:
+                image_paths = image_paths[: cfg.demo_images_per_location]
         res = process_location(loc, image_paths, cfg, model_states, output_dirs)
         results.append(res)
-        for image_result in res["images"]:
-            all_rows.extend(image_result["instances"])
+        all_rows.extend(res.get("rows", []))
 
     combined_csv = cfg.output_dir / "tables" / "all_minimap_instances.csv"
     save_csv(combined_csv, [
@@ -1059,10 +1303,14 @@ def run_pipeline(cfg: PipelineConfig, summary: Dict[str, Any], model_states: Dic
     return report
 
 
-def default_model_states(device: Optional[str] = None) -> Dict[str, Any]:
+def default_model_states(cfg: Optional[PipelineConfig] = None, device: Optional[str] = None) -> Dict[str, Any]:
     resolved = device or default_device()
+    if cfg is None:
+        tmp_root = Path(".")
+        cfg = PipelineConfig(repo_root=tmp_root, data_dir=tmp_root / "data", output_dir=tmp_root / "outputs")
     return {
         "seg": init_segmentation_model(device=resolved),
         "depth": init_depth_model(device=resolved),
         "det": init_instance_detector(device=resolved),
+        "det_zero_shot": init_zero_shot_detector(cfg, device=resolved),
     }
