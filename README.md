@@ -9,12 +9,12 @@ This is a course project visualization pipeline (qualitative analysis), not a ca
 For each location:
 - The camera position is fixed (no intentional translation between views).
 - `direction 0` is the reference forward view.
-- Each next image is captured after turning left by approximately 45°.
-- Therefore, direction index increases with left turns:
-  - `direction 1` ≈ +45° left,
-  - `direction 2` ≈ +90° left,
+- Each next image is captured after turning right by approximately 45°.
+- Therefore, direction index increases with right turns:
+  - `direction 1` ≈ +45° right,
+  - `direction 2` ≈ +90° right,
   - ...,
-  - `direction 7` ≈ +315° left.
+  - `direction 7` ≈ +315° right.
 
 The pipeline uses this known capture convention directly instead of trying to estimate per-view camera translation.
 
