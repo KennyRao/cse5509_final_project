@@ -101,36 +101,31 @@ def in_colab() -> bool:
     return module_available("google.colab")
 
 
-def resolve_project_paths(project_dir: Optional[Path] = None) -> Dict[str, Path]:
-    """Return project/data/output paths for local and Colab execution."""
-    cwd = Path.cwd()
-    repo_root = project_dir or cwd
-
-    if project_dir is None:
-        if not (repo_root / "data").exists() and (repo_root / "cse5509_final_project").exists():
-            repo_root = repo_root / "cse5509_final_project"
-        if in_colab():
-            candidates = [
-                Path("/content/drive/MyDrive/CSE 5509 Final Project"),
-                Path("/content/drive/MyDrive/cse5509_final_project"),
-            ]
-            for candidate in candidates:
-                if candidate.exists() and (candidate / "bev_pipeline.py").exists():
-                    repo_root = candidate
-                    break
-
+def resolve_project_paths(project_dir: str | Path | None = None) -> Dict[str, Path]:
+    """Return deterministic repository paths rooted at project_dir or cwd."""
+    if project_dir is not None:
+        repo_root = Path(project_dir).expanduser().resolve()
+    else:
+        repo_root = Path.cwd().resolve()
     data_dir = repo_root / "data"
-    if (data_dir / "data").exists():
-        data_dir = data_dir / "data"
     output_dir = repo_root / "outputs"
     return {"repo_root": repo_root, "data_dir": data_dir, "output_dir": output_dir}
 
 
 def discover_dataset(data_dir: Path) -> Dict[str, Any]:
     if not data_dir.exists():
-        raise FileNotFoundError(f"Dataset directory not found: {data_dir}")
+        raise FileNotFoundError(
+            f"Dataset directory not found: {data_dir}. "
+            "Expected repo_root/data/loc*/direction*.jpg."
+        )
 
     locations = sorted([p for p in data_dir.iterdir() if p.is_dir()])
+    if not locations:
+        raise ValueError(
+            f"Dataset directory has no location folders: {data_dir}. "
+            "Expected repo_root/data/loc*/direction*.jpg."
+        )
+
     per_location: Dict[str, List[Path]] = {}
     total_images = 0
 
@@ -138,6 +133,12 @@ def discover_dataset(data_dir: Path) -> Dict[str, Any]:
         images = sorted(loc.glob("*.jpg")) + sorted(loc.glob("*.png"))
         per_location[loc.name] = images
         total_images += len(images)
+
+    if total_images == 0:
+        raise ValueError(
+            f"Dataset directory contains no images: {data_dir}. "
+            "Expected repo_root/data/loc*/direction*.jpg."
+        )
 
     return {
         "location_count": len(locations),

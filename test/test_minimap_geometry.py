@@ -9,6 +9,7 @@ from bev_pipeline import (
     ego_meters_to_minimap_px,
     extract_direction_index,
     heading_for_direction,
+    resolve_project_paths,
     render_location_minimap,
     rotate_camera_relative_to_ego,
 )
@@ -90,3 +91,12 @@ def test_minimap_rendering_synthetic(tmp_path: Path) -> None:
     ]
     render_location_minimap('locX', rows, cfg, out)
     assert out.exists()
+
+
+def test_resolve_project_paths_uses_repo_data_dir_only(tmp_path: Path) -> None:
+    (tmp_path / "data" / "data").mkdir(parents=True)
+    paths = resolve_project_paths(tmp_path)
+    resolved_tmp = tmp_path.resolve()
+    assert paths["repo_root"] == resolved_tmp
+    assert paths["data_dir"] == resolved_tmp / "data"
+    assert paths["output_dir"] == resolved_tmp / "outputs"

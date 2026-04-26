@@ -29,7 +29,7 @@ The pipeline intentionally combines multiple CSE 5509-relevant computer vision t
 Expected layout:
 
 ```text
-cse5509_final_project/
+repo_root/
   data/
     loc1/
       direction 0.jpg
