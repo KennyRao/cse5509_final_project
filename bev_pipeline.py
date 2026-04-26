@@ -48,7 +48,7 @@ class PipelineConfig:
     minimap_scale_px_per_m: Optional[float] = None
     minimap_draw_dense_points: bool = True
     minimap_draw_object_labels: bool = True
-    minimap_min_confidence: float = 0.75
+    minimap_min_confidence: float = 0.5
     minimap_label_top_k_per_location: int = 60
     minimap_marker_alpha: float = 0.85
     minimap_jitter_overlapping_markers: bool = True
@@ -65,7 +65,7 @@ class PipelineConfig:
     direction_step_deg: float = 45.0
     direction_turn: str = "right"
 
-    detection_threshold: float = 0.75
+    detection_threshold: float = 0.5
     use_homography_diagnostics: bool = True
     use_zero_shot_detector: bool = True
     zero_shot_model_name: str = "IDEA-Research/grounding-dino-tiny"
