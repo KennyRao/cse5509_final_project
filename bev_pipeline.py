@@ -52,9 +52,10 @@ class PipelineConfig:
     minimap_merge_radius_m: float = 1.0
 
     # Direction convention.
+    # heading_deg is clockwise degrees from +y (north/forward).
     direction_zero_heading_deg: float = 0.0
     direction_step_deg: float = 45.0
-    direction_turn: str = "left"
+    direction_turn: str = "right"
 
     detection_threshold: float = 0.5
     use_homography_diagnostics: bool = True
@@ -523,7 +524,7 @@ def extract_direction_index(path_or_name: str) -> Optional[int]:
 
 
 def heading_for_direction(direction_index: int, cfg: PipelineConfig) -> float:
-    sign = 1.0 if cfg.direction_turn.lower() == "left" else -1.0
+    sign = 1.0 if cfg.direction_turn.lower() == "right" else -1.0
     return cfg.direction_zero_heading_deg + sign * direction_index * cfg.direction_step_deg
 
 
@@ -537,12 +538,23 @@ def estimate_camera_relative_position(instance: Dict[str, Any], image_width: int
     return lateral_x_m, forward_m
 
 
+def direction_vector_from_heading(heading_deg: float) -> Tuple[float, float]:
+    """Return (x, y) unit vector for heading clockwise from +y (north)."""
+    theta = math.radians(heading_deg)
+    return math.sin(theta), math.cos(theta)
+
+
+def rotate_clockwise_from_camera_to_ego(lateral_x_m: float, forward_m: float, heading_deg: float) -> Tuple[float, float]:
+    """Rotate camera-local (x right, y forward) into ego/world (x right, y forward)."""
+    theta = math.radians(heading_deg)
+    ego_x = lateral_x_m * math.cos(theta) + forward_m * math.sin(theta)
+    ego_y = -lateral_x_m * math.sin(theta) + forward_m * math.cos(theta)
+    return ego_x, ego_y
+
+
 def rotate_camera_relative_to_ego(lateral_x_m: float, forward_m: float, heading_deg: float, cfg: PipelineConfig) -> Tuple[float, float]:
     _ = cfg
-    theta = math.radians(heading_deg)
-    ego_x = lateral_x_m * math.cos(theta) - forward_m * math.sin(theta)
-    ego_y = lateral_x_m * math.sin(theta) + forward_m * math.cos(theta)
-    return ego_x, ego_y
+    return rotate_clockwise_from_camera_to_ego(lateral_x_m, forward_m, heading_deg)
 
 
 def minimap_scale_px_per_m(cfg: PipelineConfig) -> float:
@@ -552,6 +564,7 @@ def minimap_scale_px_per_m(cfg: PipelineConfig) -> float:
 
 
 def ego_meters_to_minimap_px(x_m: float, y_m: float, cfg: PipelineConfig) -> Tuple[int, int]:
+    # Ego/world: +x right, +y forward. Image y increases downward.
     scale = minimap_scale_px_per_m(cfg)
     c = cfg.minimap_size_px // 2
     px = int(round(c + x_m * scale))
@@ -586,6 +599,30 @@ def draw_minimap_guides(canvas, cfg: PipelineConfig) -> None:
         cv2.putText(canvas, f"dir{i}", (x - 15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1)
 
 
+def draw_stitched_bev_guides(canvas, center_px: int, scale_px_per_m: float, max_distance_m: float, cfg: PipelineConfig) -> None:
+    if not module_available("cv2"):
+        return
+    import cv2
+
+    cv2.circle(canvas, (center_px, center_px), 6, (255, 255, 255), -1)
+    cv2.arrowedLine(canvas, (center_px, center_px), (center_px, int(round(center_px - 0.22 * canvas.shape[0]))), (0, 255, 255), 2, tipLength=0.2)
+    cv2.putText(canvas, "dir0", (center_px + 6, int(round(center_px - 0.24 * canvas.shape[0]))), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1)
+
+    for meters in [5, 10, 20, 30, 40]:
+        if meters > max_distance_m:
+            continue
+        radius = int(round(meters * scale_px_per_m))
+        cv2.circle(canvas, (center_px, center_px), radius, (70, 70, 70), 1)
+
+    spoke_radius = int(round(max_distance_m * scale_px_per_m))
+    for i in range(8):
+        theta = math.radians(heading_for_direction(i, cfg))
+        spoke_x = int(round(center_px + math.sin(theta) * spoke_radius))
+        spoke_y = int(round(center_px - math.cos(theta) * spoke_radius))
+        cv2.line(canvas, (center_px, center_px), (spoke_x, spoke_y), (55, 55, 55), 1)
+        cv2.putText(canvas, f"dir{i}", (spoke_x - 14, spoke_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (165, 165, 165), 1)
+
+
 def render_direction_debug_plot(cfg: PipelineConfig, output_path: Path) -> Path:
     import numpy as np
 
@@ -597,7 +634,7 @@ def render_direction_debug_plot(cfg: PipelineConfig, output_path: Path) -> Path:
 
 
 def _bearing_deg(x_m: float, y_m: float) -> float:
-    return math.degrees(math.atan2(-x_m, y_m))
+    return (math.degrees(math.atan2(x_m, y_m)) + 360.0) % 360.0
 
 
 def _apply_optional_merge(rows: List[Dict[str, Any]], cfg: PipelineConfig) -> List[Dict[str, Any]]:
@@ -715,28 +752,62 @@ def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: Pipel
     if len(bev_images) == 0:
         raise ValueError("No BEV images provided for stitching")
 
-    canvas = np.zeros_like(bev_images[0], dtype=np.float32)
+    output_scale = cfg.bev_scale_px_per_m
+    radius_px = int(math.ceil(cfg.bev_max_distance_m * output_scale))
+    canvas_size = max(bev_images[0].shape[0], bev_images[0].shape[1], 2 * radius_px + 1)
+    center = canvas_size // 2
+    accum = np.zeros((canvas_size, canvas_size, 3), dtype=np.float32)
+    counts = np.zeros((canvas_size, canvas_size), dtype=np.float32)
+
     diagnostics = []
     for idx, bev in enumerate(bev_images):
+        bev_u8 = bev.astype(np.uint8)
+        h, w = bev_u8.shape[:2]
+        src_ego_x = w // 2
+        src_ego_y = h - 40
+
+        ys, xs = np.where(np.any(bev_u8 > 20, axis=2))
+        if ys.size == 0:
+            diagnostics.append({"view": labels[idx], "valid_pixels": 0, "status": "no_valid_pixels"})
+            continue
+
+        local_x_m = (xs.astype(np.float32) - src_ego_x) / output_scale
+        local_y_m = (src_ego_y - ys.astype(np.float32)) / output_scale
+
         direction_idx = extract_direction_index(labels[idx])
         if direction_idx is None:
             direction_idx = idx
-        rotation_deg = heading_for_direction(direction_idx, cfg)
-        rotated = bev
-        if module_available("cv2"):
-            import cv2
+        heading_deg = heading_for_direction(direction_idx, cfg)
+        world_x_m, world_y_m = rotate_clockwise_from_camera_to_ego(local_x_m, local_y_m, heading_deg)
 
-            h, w = bev.shape[:2]
-            center = (w / 2.0, h / 2.0)
-            matrix = cv2.getRotationMatrix2D(center, rotation_deg, 1.0)
-            rotated = cv2.warpAffine(bev.astype(np.uint8), matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        out_x = np.rint(center + world_x_m * output_scale).astype(np.int32)
+        out_y = np.rint(center - world_y_m * output_scale).astype(np.int32)
+        in_bounds = (out_x >= 0) & (out_x < canvas_size) & (out_y >= 0) & (out_y < canvas_size)
+        if not np.any(in_bounds):
+            diagnostics.append({"view": labels[idx], "valid_pixels": int(ys.size), "painted_pixels": 0, "heading_deg": round(heading_deg, 1)})
+            continue
 
-        alpha = 0.65
-        canvas = canvas * (1.0 - alpha) + rotated.astype(np.float32) * alpha
-        diagnostics.append({"view": labels[idx], "rotation_deg": round(rotation_deg, 1), "alpha": alpha})
+        out_x = out_x[in_bounds]
+        out_y = out_y[in_bounds]
+        src_pixels = bev_u8[ys[in_bounds], xs[in_bounds]].astype(np.float32)
 
-    stitched = np.clip(canvas, 0, 255).astype("uint8")
+        np.add.at(accum, (out_y, out_x, slice(None)), src_pixels)
+        np.add.at(counts, (out_y, out_x), 1.0)
+        diagnostics.append({
+            "view": labels[idx],
+            "heading_deg": round(heading_deg, 1),
+            "valid_pixels": int(ys.size),
+            "painted_pixels": int(np.count_nonzero(in_bounds)),
+            "status": "fixed_center_rotation",
+        })
+
+    stitched = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
+    painted = counts > 0
+    stitched[painted] = np.clip(accum[painted] / counts[painted, None], 0, 255).astype(np.uint8)
+    draw_stitched_bev_guides(stitched, center, output_scale, cfg.bev_max_distance_m, cfg)
+
     if module_available("cv2") and cfg.use_homography_diagnostics and len(bev_images) > 1:
+        # ORB/H diagnostics are optional quality checks; stitching uses known headings.
         diagnostics.extend(compute_alignment_diagnostics(bev_images, labels))
     return stitched, diagnostics
 
