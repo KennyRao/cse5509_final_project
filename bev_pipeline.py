@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import csv
 import importlib.util
+import inspect
 import json
 import math
 import re
@@ -407,7 +408,11 @@ def remove_small_components(mask, min_size: int = 100):
 
 
 def normalize_class_name(class_name: str) -> str:
-    key = class_name.strip().lower().replace("-", " ").replace("_", " ")
+    key = str(class_name).strip().lower()
+    key = re.sub(r"^[\s\.,\-_]+|[\s\.,\-_]+$", "", key)
+    key = re.sub(r"[\.,\-_]+", " ", key)
+    key = re.sub(r"\s+", " ", key).strip()
+    key = re.sub(r"^(a|an)\s+", "", key)
     return ZERO_SHOT_CLASS_ALIASES.get(key, key.replace(" ", "_"))
 
 
@@ -487,23 +492,26 @@ def _infer_instances_zero_shot(image, zero_shot_state: Dict[str, Any], cfg: Pipe
     processor = zero_shot_state["processor"]
     model = zero_shot_state["model"]
     device = zero_shot_state.get("device", "cpu")
-    inputs = processor(images=image, text=ZERO_SHOT_LABEL_PROMPTS, return_tensors="pt").to(device)
+    text_prompt = ". ".join(ZERO_SHOT_LABEL_PROMPTS) + "."
+    try:
+        inputs = processor(images=image, text=text_prompt, return_tensors="pt").to(device)
+    except Exception:
+        try:
+            inputs = processor(images=image, text=[ZERO_SHOT_LABEL_PROMPTS], return_tensors="pt").to(device)
+        except Exception as exc:
+            print(f"[WARN] Grounding DINO input formatting failed ({exc}); continuing with Mask R-CNN detections only.")
+            return []
     with torch.no_grad():
         outputs = model(**inputs)
-    target_sizes = torch.tensor([[image.size[1], image.size[0]]], device=device)
-    post = processor.post_process_grounded_object_detection(
-        outputs,
-        inputs.input_ids,
-        box_threshold=cfg.zero_shot_box_threshold,
-        text_threshold=cfg.zero_shot_text_threshold,
-        target_sizes=target_sizes,
-    )[0]
+    post = _post_process_grounding_dino(processor, outputs, inputs.input_ids, cfg, image)
     instances: List[Dict[str, Any]] = []
-    for score, box, label in zip(post.get("scores", []), post.get("boxes", []), post.get("labels", [])):
-        cls = normalize_class_name(str(label))
+    labels = post.get("text_labels", post.get("labels", []))
+    for score, box, label in zip(post.get("scores", []), post.get("boxes", []), labels):
+        cls = normalize_class_name(label if isinstance(label, str) else str(label))
         if cls not in TARGET_CLASS_NAMES:
             continue
-        bbox = [float(v) for v in box.tolist()]
+        bbox_raw = box.tolist() if hasattr(box, "tolist") else list(box)
+        bbox = [float(v) for v in bbox_raw]
         x1, y1, x2, y2 = bbox
         instances.append(
             {
@@ -516,6 +524,88 @@ def _infer_instances_zero_shot(image, zero_shot_state: Dict[str, Any], cfg: Pipe
             }
         )
     return instances
+
+
+def _post_process_grounding_dino(processor, outputs, input_ids, cfg: PipelineConfig, image) -> Dict[str, Any]:
+    target_sizes = [(image.height, image.width)]
+    empty_result: Dict[str, Any] = {"scores": [], "boxes": [], "labels": []}
+    fn = processor.post_process_grounded_object_detection
+
+    try:
+        params = inspect.signature(fn).parameters
+        supports_input_ids = "input_ids" in params
+        if "box_threshold" in params:
+            results = fn(
+                outputs,
+                input_ids,
+                box_threshold=cfg.zero_shot_box_threshold,
+                text_threshold=cfg.zero_shot_text_threshold,
+                target_sizes=target_sizes,
+            )
+            return results[0] if results else empty_result
+        if "threshold" in params:
+            kwargs: Dict[str, Any] = {
+                "threshold": cfg.zero_shot_box_threshold,
+                "text_threshold": cfg.zero_shot_text_threshold,
+                "target_sizes": target_sizes,
+            }
+            if supports_input_ids:
+                kwargs["input_ids"] = input_ids
+            results = fn(outputs, **kwargs)
+            return results[0] if results else empty_result
+    except Exception:
+        pass
+
+    try:
+        results = fn(
+            outputs,
+            input_ids,
+            box_threshold=cfg.zero_shot_box_threshold,
+            text_threshold=cfg.zero_shot_text_threshold,
+            target_sizes=target_sizes,
+        )
+        return results[0] if results else empty_result
+    except TypeError as exc:
+        msg = str(exc).lower()
+        if "box_threshold" not in msg and "unexpected keyword" not in msg:
+            print(
+                "[WARN] Grounding DINO post-processing failed; continuing with Mask R-CNN detections only."
+            )
+            return empty_result
+    except Exception:
+        print(
+            "[WARN] Grounding DINO post-processing failed; continuing with Mask R-CNN detections only."
+        )
+        return empty_result
+
+    try:
+        results = fn(
+            outputs,
+            input_ids=input_ids,
+            threshold=cfg.zero_shot_box_threshold,
+            text_threshold=cfg.zero_shot_text_threshold,
+            target_sizes=target_sizes,
+        )
+        return results[0] if results else empty_result
+    except TypeError:
+        try:
+            results = fn(
+                outputs,
+                threshold=cfg.zero_shot_box_threshold,
+                text_threshold=cfg.zero_shot_text_threshold,
+                target_sizes=target_sizes,
+            )
+            return results[0] if results else empty_result
+        except Exception:
+            print(
+                "[WARN] Grounding DINO post-processing failed; continuing with Mask R-CNN detections only."
+            )
+            return empty_result
+    except Exception:
+        print(
+            "[WARN] Grounding DINO post-processing failed; continuing with Mask R-CNN detections only."
+        )
+        return empty_result
 
 
 def infer_instances(
