@@ -1,31 +1,17 @@
 # CSE 5509 Final Project: Ego-Centered 360° Minimap from Single-Camera Views
 
-## Project Overview
-This project builds an interpretable, game-style minimap/radar from handheld image captures at street locations. For each location, the camera remains at one fixed physical spot while the photographer rotates in place and captures eight views (`direction 0` through `direction 7`). The system combines pretrained semantic segmentation, monocular depth estimation, and object detection, then projects detections into a shared ego-centered top-down map. The final output is a per-location minimap with the ego marker at the center, distance rings, direction guides, and labeled object markers.
+## 1) Overview
+This repository implements a qualitative course-project pipeline that builds an ego-centered 360° minimap from single-camera images captured at a fixed location while rotating in place. The primary output is an **object-level minimap** generated from projected detection rows. A separate **stitched BEV** image is also generated as a **pixel-level diagnostic** from rotated per-image BEV rasters. The system is intended for explainable visualization and demo discussion, not calibrated autonomous-driving mapping.
 
-This is a course project visualization pipeline (qualitative analysis), not a calibrated vehicle-grade mapping system.
+## 2) Course requirement alignment
+This project uses multiple CV tasks from class:
+- semantic segmentation (SegFormer),
+- monocular depth estimation (DPT),
+- object detection (Mask R-CNN, optional Grounding DINO),
+- geometric projection into an ego-centered frame,
+- optional feature-matching diagnostics (ORB) for alignment checks.
 
-## Data Collection and Direction Convention
-For each location:
-- The camera position is fixed (no intentional translation between views).
-- `direction 0` is the reference forward view.
-- Each next image is captured after turning right by approximately 45°.
-- Therefore, direction index increases with right turns:
-  - `direction 1` ≈ +45° right,
-  - `direction 2` ≈ +90° right,
-  - ...,
-  - `direction 7` ≈ +315° right.
-
-The pipeline uses this known capture convention directly instead of trying to estimate per-view camera translation.
-
-## Methods and Course Topic Coverage
-The pipeline intentionally combines multiple CSE 5509-relevant computer vision tasks:
-1. **Pretrained semantic segmentation (SegFormer)** for scene structure and ground/object diagnostics.
-2. **Pretrained monocular depth estimation (DPT)** for approximate distance cues.
-3. **Pretrained object detection (Mask R-CNN + optional Grounding DINO)** for object categories and bounding boxes.
-4. **Geometric minimap projection** using assumed horizontal FOV + contact-point depth + known direction headings.
-
-## Dataset Format
+## 3) Dataset format
 Expected layout:
 
 ```text
@@ -33,102 +19,100 @@ repo_root/
   data/
     loc1/
       direction 0.jpg
-      direction 1.jpg
       ...
       direction 7.jpg
     loc2/
       ...
 ```
 
-Supported direction-like filename patterns include examples such as:
-- `direction 0.jpg`
-- `direction_1.jpg`
-- `loc1_direction_7.jpg`
+The pipeline expects `repo_root/data/` (not `data/data/`).
 
-## How the Minimap Projection Works (Approximate)
-For each detection:
-1. Use the bottom-center of the bounding box as a ground contact proxy.
-2. Read monocular depth at that contact point; map to approximate meters.
-3. Convert contact x-position into lateral angle using an assumed horizontal FOV.
-4. Estimate camera-relative coordinates:
-   - lateral offset (right/left)
-   - forward range
-5. Rotate that 2D point by known heading from the image direction index.
-6. Draw all rotated detections into one shared ego-centered minimap canvas.
+## 4) Direction convention (clockwise)
+- `direction 0` = forward/up on minimap.
+- `direction 1` = up-right (+45° clockwise).
+- `direction 2` = right (+90° clockwise).
+- ...
+- `direction 7` = up-left (+315° clockwise).
 
-This avoids the old confusing approach of rotating whole rendered BEV canvases with off-center ego points.
+## 5) Pipeline overview
+1. Load RGB image.
+2. Run SegFormer for scene masks (diagnostic).
+3. Run DPT monocular depth (approximate; treated as inverse depth by default).
+4. Run Mask R-CNN (+ optional Grounding DINO for open-vocabulary classes like `dumpster`, `road_sign`).
+5. Use bbox bottom-center as a ground-contact proxy.
+6. Project detections to ego meters using FOV + depth approximation.
+7. Apply image-space class-aware NMS, then location-level heuristic deduplication in ego-meter space.
+8. Render final minimap from deduplicated rows.
+9. Render stitched BEV diagnostic from rotated per-image BEV pixels.
 
-## Running Locally
+## 6) Run in Google Colab
+1. Open `final-project-cse5509-v2.ipynb` in Colab.
+2. Install dependencies if needed.
+3. Mount Drive when prompted.
+4. Set `PROJECT_DIR` in the notebook.
+5. Run cells top-to-bottom.
+
+## 7) Run locally
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 jupyter notebook
 ```
+Then open `final-project-cse5509-v2.ipynb` and run top-to-bottom.
 
-Open `final-project-cse5509-v2.ipynb` and run cells top-to-bottom.
+## 8) Configuration notes
+- Balanced demo defaults:
+  - `detection_threshold = 0.70`
+  - `minimap_min_confidence = 0.70`
+- Recommended tuning behavior:
+  - `0.75` is cleaner but may miss objects,
+  - `0.65` may recover more objects but should be visually checked for false positives.
+- Zero-shot candidate thresholds (default):
+  - `zero_shot_box_threshold = 0.35`
+  - `zero_shot_text_threshold = 0.30`
+- FOV is configurable (`horizontal_fov_deg`) and affects projection geometry.
+- Demo mode:
+  - `run_small_demo=True`, `demo_locations=1`, `demo_images_per_location=None` uses all images in first location.
 
-## Running in Google Colab
-1. Open the notebook in Colab.
-2. Mount Drive when prompted.
-3. Ensure your folder contains:
-   - `bev_pipeline.py`
-   - `final-project-cse5509-v2.ipynb`
-   - `data/`
-4. Run cells top-to-bottom.
-
-The notebook uses `PROJECT_DIR` and `resolve_project_paths(...)` so the same workflow works for local and Colab usage with minimal manual edits.
-
-## Current Default Configuration Highlights
-- Detection confidence threshold defaults to **0.75**.
-- Minimap confidence filter defaults to **0.75**.
-- Primary target classes are: `person`, `car`, `bus`, `motorcycle`, `bicycle`, `dumpster`, `road_sign`.
-- Optional zero-shot detector uses `IDEA-Research/grounding-dino-tiny` to improve `dumpster` / `road_sign` coverage.
-- DPT depth normalization is interpreted as inverse-depth by default (higher normalized value = nearer).
-- Location-level deduplication uses class-aware NMS-style radius suppression in ego-meter coordinates.
-- Minimap/BEV canvas defaults are larger for readability (bigger labels, clearer legend).
-- Small demo mode now means **first N locations** and can include **all images** in those locations when `demo_images_per_location=None`.
-
-## Main Outputs
-- **Primary final output (per location)**:
-  - `outputs/per_location/loc1_minimap.png`
-  - `outputs/per_location/loc2_minimap.png`
-  - ...
-- Per-image diagnostics:
-  - `outputs/per_image/*_det.png` (detection overlays)
-  - `outputs/per_image/*_bev.png` (BEV diagnostics)
-- Direction convention debug plot:
-  - `outputs/diagnostics/loc*_direction_debug.png`
-- Instance tables:
+## 9) Outputs
+- Per-image detection overlays: `outputs/per_image/*_det.png`
+- Per-image BEV diagnostics: `outputs/per_image/*_bev.png`
+- Final minimap (primary output): `outputs/per_location/loc*_minimap.png`
+- Stitched BEV (diagnostic): `outputs/per_location/loc*_stitched_bev.png`
+- Tables/JSON/CSV:
   - `outputs/tables/loc*_minimap_instances.json`
   - `outputs/tables/loc*_minimap_instances.csv`
   - `outputs/tables/all_minimap_instances.csv`
-- Full run summary:
-  - `outputs/run_report.json`
+  - `outputs/tables/loc*_dedup_diagnostics.json`
+  - `outputs/tables/loc*_stitch_diagnostics.json`
+- Run summary: `outputs/run_report.json`
 
-## How to Interpret the Minimap
-- Ego/player marker is at the image center.
-- `dir0` arrow points forward/reference direction.
-- Rings indicate approximate distance (e.g., 5m, 10m, 20m, 30m, 40m).
-- Marker colors indicate object class (person, car, bus, motorcycle, bicycle, dumpster, road_sign).
-- Labels (e.g., `car1`, `person2`) are shown for the most readable subset.
+## 10) How to interpret the minimap
+- Center marker = ego position.
+- Rings = approximate distance intervals.
+- Spokes/labels indicate direction convention.
+- Colored markers = object class.
+- Labels (e.g., `car1`) are unique after deduplication/relabeling.
 
-## Intermediate Diagnostics
-The project keeps intermediate outputs so TAs can inspect failure modes:
-- segmentation-derived masks,
-- per-image detections and BEV diagnostics,
-- direction-convention debug rays,
-- per-location object tables with bearing/range and projected minimap coordinates.
+## 11) Minimap vs stitched BEV
+- **Minimap (final)**: object-level, generated from projected detection rows, deduplicated and labeled.
+- **Stitched BEV (diagnostic)**: pixel-level, generated from rotated per-image BEV diagnostic images; does not directly consume final minimap table rows.
 
-## Assumptions and Limitations
-- Monocular depth is not true calibrated metric distance.
-- Open-vocabulary detection can hallucinate or miss objects.
-- Camera intrinsics are approximated from image width + assumed horizontal FOV.
-- Bounding-box bottom center is only an approximate ground-contact estimate.
-- Adjacent direction views overlap, so repeated detections can occur.
-- Deduplication is heuristic because this project does not use calibrated multi-view 3D reconstruction.
-- Dense rows of cars/bicycles can yield many close detections, potentially cluttering the minimap.
-- The minimap is best interpreted qualitatively.
+## 12) Assumptions and limitations
+- Monocular depth is approximate and not calibrated metric depth.
+- DPT normalization is mapped to pseudo-metric distance via configured bounds.
+- Object projection uses bbox bottom-center as ground-contact proxy.
+- FOV is approximate unless calibrated for the capture camera.
+- Deduplication is heuristic and reduces repeats; it does not prove object identity.
+- False positives/missed detections can occur.
 
-## AI Usage Statement
-AI tools were used to assist with code restructuring, documentation drafting, and notebook organization. Final design decisions, limitations, and project claims were reviewed and edited for accurate course-project reporting.
+## 13) AI usage statement
+AI tools were used for code cleanup, docstring/documentation drafting, and notebook organization. Final claims and technical limitations were reviewed and kept consistent with a qualitative course-project scope.
+
+## 14) Troubleshooting
+- **Missing `data/`**: verify dataset is in `repo_root/data/loc*/direction*.jpg`.
+- **Colab path issue**: check `PROJECT_DIR` points to folder containing `bev_pipeline.py`.
+- **Grounding DINO unavailable**: pipeline continues with Mask R-CNN-only detections.
+- **Slow model loading**: first run may download model weights.
+- **No CUDA**: CPU fallback is supported but slower.

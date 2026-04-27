@@ -1,7 +1,17 @@
-"""Helper functions for the CSE 5509 BEV/minimap final project.
+"""Ego-centered 360° minimap pipeline for the CSE 5509 final project.
 
-The pipeline combines pretrained semantic segmentation, monocular depth, and
-instance detection, then projects detections into an ego-centered minimap.
+This module implements a qualitative visualization pipeline for fixed-location,
+in-place camera rotations (``direction 0`` ... ``direction 7``). The final
+output is an object-level minimap built from projected detection rows
+(``*_minimap_instances`` tables). It also produces a stitched BEV diagnostic
+that is pixel-level and created by rotating/merging per-image BEV diagnostic
+rasters.
+
+Key assumptions:
+    * Monocular depth (DPT) is approximate and not calibrated metric depth.
+    * DPT output is treated as inverse depth by default.
+    * Bounding-box bottom-center is used as a ground-contact proxy.
+    * Direction indexing is clockwise from ``direction 0``.
 """
 
 from __future__ import annotations
@@ -20,6 +30,20 @@ import shutil
 
 @dataclass
 class PipelineConfig:
+    """Configuration for dataset paths, model behavior, geometry, and outputs.
+
+    Notes:
+        * ``detection_threshold`` filters Mask R-CNN detections before
+          projection.
+        * ``minimap_min_confidence`` is the final confidence filter before
+          writing rows to the minimap tables.
+        * These two thresholds should usually be tuned together:
+            - ``0.70`` is a balanced demo setting.
+            - ``0.75`` is cleaner but can miss objects.
+            - ``0.65`` may recover more objects but needs visual validation.
+        * Zero-shot thresholds are candidate-generation controls and are kept
+          slightly lower by default for recall.
+    """
     repo_root: Path
     data_dir: Path
     output_dir: Path
@@ -36,7 +60,7 @@ class PipelineConfig:
     max_depth_m: float = 40.0
     depth_is_inverse: bool = True
 
-    # Legacy per-image BEV diagnostic settings.
+    # Per-image BEV diagnostic settings (stitched later for diagnostics).
     bev_max_distance_m: float = 40.0
     bev_scale_px_per_m: float = 18.0
     bev_height_px: int = 1100
@@ -48,7 +72,7 @@ class PipelineConfig:
     minimap_scale_px_per_m: Optional[float] = None
     minimap_draw_dense_points: bool = True
     minimap_draw_object_labels: bool = True
-    minimap_min_confidence: float = 0.5
+    minimap_min_confidence: float = 0.70
     minimap_label_top_k_per_location: int = 60
     minimap_marker_alpha: float = 0.85
     minimap_jitter_overlapping_markers: bool = True
@@ -65,7 +89,8 @@ class PipelineConfig:
     direction_step_deg: float = 45.0
     direction_turn: str = "right"
 
-    detection_threshold: float = 0.75
+    detection_threshold: float = 0.70
+    image_nms_iou_threshold: float = 0.5
     use_homography_diagnostics: bool = True
     use_zero_shot_detector: bool = True
     zero_shot_model_name: str = "IDEA-Research/grounding-dino-tiny"
@@ -138,6 +163,7 @@ DEDUP_RADIUS_BY_CLASS_DEFAULT = {
 
 
 def module_available(name: str) -> bool:
+    """Return ``True`` when an importable module with ``name`` exists."""
     try:
         return importlib.util.find_spec(name) is not None
     except ModuleNotFoundError:
@@ -145,6 +171,7 @@ def module_available(name: str) -> bool:
 
 
 def get_cv2():
+    """Import OpenCV if available; otherwise return ``None``."""
     try:
         import cv2
 
@@ -154,11 +181,21 @@ def get_cv2():
 
 
 def in_colab() -> bool:
+    """Return whether the runtime appears to be Google Colab."""
     return module_available("google.colab")
 
 
 def resolve_project_paths(project_dir: str | Path | None = None) -> Dict[str, Path]:
-    """Return deterministic repository paths rooted at project_dir or cwd."""
+    """Resolve repository, data, and output paths.
+
+    Args:
+        project_dir: Optional repository root. If omitted, current working
+            directory is used.
+
+    Returns:
+        Dictionary with keys ``repo_root``, ``data_dir`` (repo_root/data), and
+        ``output_dir`` (repo_root/outputs).
+    """
     if project_dir is not None:
         repo_root = Path(project_dir).expanduser().resolve()
     else:
@@ -169,6 +206,18 @@ def resolve_project_paths(project_dir: str | Path | None = None) -> Dict[str, Pa
 
 
 def discover_dataset(data_dir: Path) -> Dict[str, Any]:
+    """Discover location folders and image files inside ``repo_root/data``.
+
+    Args:
+        data_dir: Dataset root expected to contain ``loc*/direction*.jpg``.
+
+    Returns:
+        Summary dictionary with location names, counts, and per-location files.
+
+    Raises:
+        FileNotFoundError: If ``data_dir`` does not exist.
+        ValueError: If no locations or images are found.
+    """
     if not data_dir.exists():
         raise FileNotFoundError(
             f"Dataset directory not found: {data_dir}. "
@@ -206,6 +255,15 @@ def discover_dataset(data_dir: Path) -> Dict[str, Any]:
 
 
 def ensure_output_dirs(base: Path, clean_output_dir: bool = False) -> Dict[str, Path]:
+    """Create output directory structure used by the pipeline.
+
+    Args:
+        base: Root output directory.
+        clean_output_dir: If ``True``, remove and recreate ``base``.
+
+    Returns:
+        Dictionary of concrete output paths.
+    """
     if clean_output_dir and base.exists():
         shutil.rmtree(base)
 
@@ -222,6 +280,7 @@ def ensure_output_dirs(base: Path, clean_output_dir: bool = False) -> Dict[str, 
 
 
 def default_device() -> str:
+    """Return ``cuda`` when available, otherwise ``cpu``."""
     if module_available("torch"):
         import torch
 
@@ -230,6 +289,11 @@ def default_device() -> str:
 
 
 def load_rgb_image(path: Path):
+    """Load a file as an RGB PIL image.
+
+    Raises:
+        FileNotFoundError: If the image path does not exist.
+    """
     if not path.exists():
         raise FileNotFoundError(f"Image not found: {path}")
     from PIL import Image
@@ -238,6 +302,7 @@ def load_rgb_image(path: Path):
 
 
 def init_segmentation_model(device: str = "cpu") -> Dict[str, Any]:
+    """Initialize SegFormer semantic segmentation model state."""
     if not module_available("transformers") or not module_available("torch"):
         return {"available": False, "reason": "transformers/torch not installed"}
     from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
@@ -257,6 +322,7 @@ def init_segmentation_model(device: str = "cpu") -> Dict[str, Any]:
 
 
 def init_depth_model(device: str = "cpu") -> Dict[str, Any]:
+    """Initialize DPT depth estimation pipeline state."""
     if not module_available("transformers"):
         return {"available": False, "reason": "transformers not installed"}
     from transformers import pipeline
@@ -266,6 +332,7 @@ def init_depth_model(device: str = "cpu") -> Dict[str, Any]:
 
 
 def init_instance_detector(device: str = "cpu") -> Dict[str, Any]:
+    """Initialize Mask R-CNN instance detector state."""
     if not module_available("torchvision") or not module_available("torch"):
         return {"available": False, "reason": "torchvision/torch not installed", "fallback": "no_detections"}
     from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights, maskrcnn_resnet50_fpn
@@ -280,6 +347,7 @@ def init_instance_detector(device: str = "cpu") -> Dict[str, Any]:
 
 
 def init_zero_shot_detector(cfg: PipelineConfig, device: str = "cpu") -> Dict[str, Any]:
+    """Initialize optional Grounding DINO detector state."""
     if not cfg.use_zero_shot_detector:
         return {"available": False, "reason": "disabled by config"}
     if not module_available("transformers") or not module_available("torch"):
@@ -298,6 +366,10 @@ def init_zero_shot_detector(cfg: PipelineConfig, device: str = "cpu") -> Dict[st
 
 
 def infer_segmentation(image, seg_state: Dict[str, Any]):
+    """Run semantic segmentation and derive ground/object masks.
+
+    Returns fallback empty masks when segmentation is unavailable.
+    """
     import numpy as np
 
     if not seg_state.get("available", False):
@@ -346,6 +418,11 @@ def infer_segmentation(image, seg_state: Dict[str, Any]):
 
 
 def infer_depth(image, depth_state: Dict[str, Any]):
+    """Run monocular depth and normalize to [0, 1].
+
+    The normalized map is not metric depth. It is later converted with
+    ``normalized_depth_to_distance`` using configured min/max depth bounds.
+    """
     import numpy as np
 
     h, w = image.size[1], image.size[0]
@@ -371,6 +448,7 @@ def infer_depth(image, depth_state: Dict[str, Any]):
 
 
 def cleanup_masks(ground_mask, object_mask):
+    """Apply morphology and small-component cleanup to segmentation masks."""
     import numpy as np
 
     cv2 = get_cv2()
@@ -393,6 +471,7 @@ def cleanup_masks(ground_mask, object_mask):
 
 
 def remove_small_components(mask, min_size: int = 100):
+    """Remove connected components smaller than ``min_size`` pixels."""
     import numpy as np
 
     cv2 = get_cv2()
@@ -408,6 +487,12 @@ def remove_small_components(mask, min_size: int = 100):
 
 
 def normalize_class_name(class_name: str) -> str:
+    """Normalize detector label text into canonical class names.
+
+    Examples:
+        ``traffic sign`` / ``stop sign`` / ``road sign`` -> ``road_sign``
+        ``trash dumpster`` -> ``dumpster``
+    """
     key = str(class_name).strip().lower()
     key = re.sub(r"^[\s\.,\-_]+|[\s\.,\-_]+$", "", key)
     key = re.sub(r"[\.,\-_]+", " ", key)
@@ -417,6 +502,7 @@ def normalize_class_name(class_name: str) -> str:
 
 
 def _instance_iou_xyxy(a: Sequence[float], b: Sequence[float]) -> float:
+    """Compute IoU of two ``[x1, y1, x2, y2]`` boxes."""
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)
@@ -432,6 +518,7 @@ def _instance_iou_xyxy(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 def _dedup_image_space_instances(instances: Sequence[Dict[str, Any]], iou_threshold: float = 0.5) -> List[Dict[str, Any]]:
+    """Apply image-space NMS per class, keeping highest-confidence boxes."""
     kept: List[Dict[str, Any]] = []
     for candidate in sorted(instances, key=lambda i: -float(i["confidence"])):
         suppress = False
@@ -447,6 +534,7 @@ def _dedup_image_space_instances(instances: Sequence[Dict[str, Any]], iou_thresh
 
 
 def _infer_instances_maskrcnn(image, detector_state: Dict[str, Any], threshold: float = 0.5) -> List[Dict[str, Any]]:
+    """Infer object instances using Mask R-CNN and normalize class labels."""
     if not detector_state.get("available", False):
         return []
 
@@ -481,10 +569,11 @@ def _infer_instances_maskrcnn(image, detector_state: Dict[str, Any], threshold: 
                 "detector_source": "mask_rcnn",
             }
         )
-    return [i for i in instances if i["class_name"] in TARGET_CLASS_NAMES or i["class_name"] == "truck"]
+    return [i for i in instances if i["class_name"] in TARGET_CLASS_NAMES]
 
 
 def _infer_instances_zero_shot(image, zero_shot_state: Dict[str, Any], cfg: PipelineConfig) -> List[Dict[str, Any]]:
+    """Infer open-vocabulary detections with Grounding DINO when available."""
     if not zero_shot_state.get("available", False):
         return []
     import torch
@@ -527,6 +616,7 @@ def _infer_instances_zero_shot(image, zero_shot_state: Dict[str, Any], cfg: Pipe
 
 
 def _post_process_grounding_dino(processor, outputs, input_ids, cfg: PipelineConfig, image) -> Dict[str, Any]:
+    """Compatibility wrapper for Grounding DINO post-process API variants."""
     target_sizes = [(image.height, image.width)]
     empty_result: Dict[str, Any] = {"scores": [], "boxes": [], "labels": []}
     fn = processor.post_process_grounded_object_detection
@@ -615,19 +705,21 @@ def infer_instances(
     cfg: Optional[PipelineConfig] = None,
     threshold: float = 0.5,
 ) -> Dict[str, Any]:
+    """Run available detectors and return deduplicated, labeled instances."""
     if cfg is None:
         raise ValueError("infer_instances requires cfg")
     if not detector_state.get("available", False) and not (zero_shot_state or {}).get("available", False):
         return {"instances": [], "warning": detector_state.get("reason", "detector unavailable")}
     instances = _infer_instances_maskrcnn(image, detector_state, threshold=threshold)
     instances.extend(_infer_instances_zero_shot(image, zero_shot_state or {}, cfg))
-    instances = _dedup_image_space_instances(instances, iou_threshold=0.5)
+    instances = _dedup_image_space_instances(instances, iou_threshold=cfg.image_nms_iou_threshold)
 
     instances = assign_instance_labels(instances)
     return {"instances": instances}
 
 
 def assign_instance_labels(instances: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Assign per-image readable labels like ``car1``, ``person2``."""
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for inst in instances:
         grouped.setdefault(inst["class_name"], []).append(inst)
@@ -642,18 +734,29 @@ def assign_instance_labels(instances: List[Dict[str, Any]]) -> List[Dict[str, An
 
 
 def assert_unique_labels(instances: Sequence[Dict[str, Any]]) -> None:
+    """Validate that ``instance_label`` values are unique."""
     labels = [i["instance_label"] for i in instances]
     if len(labels) != len(set(labels)):
         raise ValueError("Duplicate instance labels found")
 
 
 def get_intrinsics(width: int, height: int, hfov_deg: float) -> Dict[str, float]:
+    """Approximate pinhole intrinsics from width and horizontal FOV."""
     fx = width / (2.0 * math.tan(math.radians(hfov_deg / 2.0)))
     fy = fx
     return {"fx": fx, "fy": fy, "cx": width / 2.0, "cy": height / 2.0}
 
 
 def normalized_depth_to_distance(depth_norm, depth_min: float, depth_max: float, inverse: bool = True):
+    """Map normalized depth to approximate distance in meters.
+
+    Args:
+        depth_norm: Normalized depth in [0, 1].
+        depth_min: Near distance bound in meters.
+        depth_max: Far distance bound in meters.
+        inverse: When ``True`` treat larger normalized values as nearer
+            (DPT-style inverse-depth assumption).
+    """
     import numpy as np
 
     depth_norm = np.clip(depth_norm, 0.0, 1.0)
@@ -662,6 +765,11 @@ def normalized_depth_to_distance(depth_norm, depth_min: float, depth_max: float,
 
 
 def build_bev(seg_result: Dict[str, Any], depth_result: Dict[str, Any], cfg: PipelineConfig):
+    """Build per-image diagnostic BEV pixels from segmentation + depth.
+
+    This output is pixel-level diagnostic content; it is not the final
+    object-level minimap table.
+    """
     import numpy as np
 
     depth = depth_result["depth"]
@@ -695,6 +803,7 @@ def build_bev(seg_result: Dict[str, Any], depth_result: Dict[str, Any], cfg: Pip
 
 
 def draw_bev_guides(bev, ego_x: int, ego_y: int, cfg: PipelineConfig) -> None:
+    """Draw ego marker and range rings on a per-image BEV diagnostic."""
     cv2 = get_cv2()
     if cv2 is None:
         return
@@ -711,6 +820,7 @@ def draw_bev_guides(bev, ego_x: int, ego_y: int, cfg: PipelineConfig) -> None:
 
 
 def add_instance_markers(bev_result: Dict[str, Any], instances: List[Dict[str, Any]], depth_m, cfg: PipelineConfig):
+    """Overlay detected instance markers on a BEV diagnostic image."""
     bev = bev_result["bev"]
     ego_x, ego_y = bev_result["ego_xy"]
     intr = get_intrinsics(depth_m.shape[1], depth_m.shape[0], cfg.horizontal_fov_deg)
@@ -754,6 +864,7 @@ def add_instance_markers(bev_result: Dict[str, Any], instances: List[Dict[str, A
 
 
 def draw_detection_overlay(image, instances: Sequence[Dict[str, Any]]):
+    """Render detection boxes and labels on the input RGB image."""
     import numpy as np
 
     arr = np.array(image).copy()
@@ -769,6 +880,7 @@ def draw_detection_overlay(image, instances: Sequence[Dict[str, Any]]):
 
 
 def extract_direction_index(path_or_name: str) -> Optional[int]:
+    """Extract integer direction index from filenames like ``direction 3``."""
     text = Path(path_or_name).stem.lower()
     m = re.search(r"direction[\s_\-]*(\d+)", text)
     if m:
@@ -780,11 +892,16 @@ def extract_direction_index(path_or_name: str) -> Optional[int]:
 
 
 def heading_for_direction(direction_index: int, cfg: PipelineConfig) -> float:
+    """Map direction index to heading in clockwise degrees from +y."""
     sign = 1.0 if cfg.direction_turn.lower() == "right" else -1.0
     return cfg.direction_zero_heading_deg + sign * direction_index * cfg.direction_step_deg
 
 
 def estimate_camera_relative_position(instance: Dict[str, Any], image_width: int, cfg: PipelineConfig) -> Tuple[float, float]:
+    """Estimate camera-relative (x right, y forward) coordinates for an object.
+
+    Uses the bounding-box bottom-center x-position and estimated depth.
+    """
     contact_x = float(instance["contact_xy"][0])
     depth_m = float(instance["estimated_depth_m"])
     normalized_x = (contact_x - image_width / 2.0) / (image_width / 2.0)
@@ -809,17 +926,20 @@ def rotate_clockwise_from_camera_to_ego(lateral_x_m: float, forward_m: float, he
 
 
 def rotate_camera_relative_to_ego(lateral_x_m: float, forward_m: float, heading_deg: float, cfg: PipelineConfig) -> Tuple[float, float]:
+    """Rotate camera-relative meters into ego/world meters."""
     _ = cfg
     return rotate_clockwise_from_camera_to_ego(lateral_x_m, forward_m, heading_deg)
 
 
 def minimap_scale_px_per_m(cfg: PipelineConfig) -> float:
+    """Return minimap pixel-per-meter scale."""
     if cfg.minimap_scale_px_per_m is not None:
         return cfg.minimap_scale_px_per_m
     return (cfg.minimap_size_px * 0.48) / cfg.minimap_max_distance_m
 
 
 def ego_meters_to_minimap_px(x_m: float, y_m: float, cfg: PipelineConfig) -> Tuple[int, int]:
+    """Convert ego-frame meters to minimap pixel coordinates."""
     # Ego/world: +x right, +y forward. Image y increases downward.
     scale = minimap_scale_px_per_m(cfg)
     c = cfg.minimap_size_px // 2
@@ -829,6 +949,7 @@ def ego_meters_to_minimap_px(x_m: float, y_m: float, cfg: PipelineConfig) -> Tup
 
 
 def draw_minimap_guides(canvas, cfg: PipelineConfig) -> None:
+    """Draw ego marker, rings, and direction spokes on the minimap canvas."""
     cv2 = get_cv2()
     if cv2 is None:
         return
@@ -856,6 +977,7 @@ def draw_minimap_guides(canvas, cfg: PipelineConfig) -> None:
 
 
 def draw_stitched_bev_guides(canvas, center_px: int, scale_px_per_m: float, max_distance_m: float, cfg: PipelineConfig) -> None:
+    """Draw rings/spokes on stitched BEV diagnostic canvas."""
     cv2 = get_cv2()
     if cv2 is None:
         return
@@ -880,6 +1002,7 @@ def draw_stitched_bev_guides(canvas, center_px: int, scale_px_per_m: float, max_
 
 
 def render_direction_debug_plot(cfg: PipelineConfig, output_path: Path) -> Path:
+    """Render a direction-convention guide image and save it."""
     import numpy as np
 
     canvas = np.zeros((cfg.minimap_size_px, cfg.minimap_size_px, 3), dtype=np.uint8)
@@ -890,10 +1013,17 @@ def render_direction_debug_plot(cfg: PipelineConfig, output_path: Path) -> Path:
 
 
 def _bearing_deg(x_m: float, y_m: float) -> float:
+    """Return clockwise bearing degrees from +y for ego-frame coordinates."""
     return (math.degrees(math.atan2(x_m, y_m)) + 360.0) % 360.0
 
 
 def deduplicate_location_rows(rows: List[Dict[str, Any]], cfg: PipelineConfig) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Heuristically deduplicate projected objects in ego-meter space.
+
+    This is location-level class-aware NMS using distance radii. It reduces
+    repeated detections across overlapping directions but does not prove two
+    rows are the same physical object.
+    """
     if not cfg.minimap_merge_nearby_same_class:
         return rows, []
 
@@ -933,6 +1063,7 @@ def deduplicate_location_rows(rows: List[Dict[str, Any]], cfg: PipelineConfig) -
 
 
 def relabel_instances_per_class(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Relabel deduplicated rows per class for stable readable labels."""
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         grouped.setdefault(normalize_class_name(row["class_name"]), []).append(row)
@@ -947,6 +1078,11 @@ def relabel_instances_per_class(rows: List[Dict[str, Any]]) -> List[Dict[str, An
 
 
 def render_location_minimap(location_name: str, rows: List[Dict[str, Any]], cfg: PipelineConfig, output_path: Path) -> Path:
+    """Render and save final object-level minimap for one location.
+
+    The minimap is produced from projected detection rows (not BEV pixels) and
+    uses the deduplicated location table.
+    """
     import numpy as np
 
     cv2 = get_cv2()
@@ -1004,6 +1140,7 @@ def render_location_minimap(location_name: str, rows: List[Dict[str, Any]], cfg:
 
 
 def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert an internal row to a JSON/CSV-friendly serializable row."""
     return {
         "source_image": row["source_image"],
         "location": row["location"],
@@ -1029,6 +1166,7 @@ def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def save_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    """Write rows to CSV, creating parent directories as needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         path.write_text("", encoding="utf-8")
@@ -1041,6 +1179,12 @@ def save_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
 
 
 def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: PipelineConfig):
+    """Compose stitched pixel-level BEV diagnostic by fixed-center rotation.
+
+    Each per-image BEV raster is rotated into a shared ego frame according to
+    the clockwise direction convention. Black/background pixels do not erase
+    previously accumulated content.
+    """
     import numpy as np
 
     if len(bev_images) == 0:
@@ -1113,6 +1257,7 @@ def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: Pipel
 
 
 def compute_alignment_diagnostics(images: Sequence, labels: Sequence[str]) -> List[Dict[str, Any]]:
+    """Compute optional ORB feature-match diagnostics between adjacent views."""
     cv2 = get_cv2()
     if cv2 is None:
         return [{"status": "skipped_cv2_missing", "pair": "n/a", "matches": 0, "inliers": 0}]
@@ -1158,6 +1303,7 @@ def compute_alignment_diagnostics(images: Sequence, labels: Sequence[str]) -> Li
 
 
 def save_array_image(path: Path, arr) -> None:
+    """Save a numpy image array to disk."""
     from PIL import Image
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1165,11 +1311,18 @@ def save_array_image(path: Path, arr) -> None:
 
 
 def save_json(path: Path, obj: Any) -> None:
+    """Write JSON to disk with indentation."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
 
 def process_image(image_path: Path, cfg: PipelineConfig, model_states: Dict[str, Any], output_dirs: Dict[str, Path]):
+    """Process one source image and write per-image outputs.
+
+    Side effects:
+        Saves detection overlays, per-image BEV diagnostics, segmentation
+        diagnostics, and per-image instance JSON.
+    """
     image = load_rgb_image(image_path)
     seg = infer_segmentation(image, model_states["seg"])
     depth = infer_depth(image, model_states["depth"])
@@ -1277,6 +1430,7 @@ def process_image(image_path: Path, cfg: PipelineConfig, model_states: Dict[str,
 
 
 def process_location(location_name: str, image_paths: Sequence[Path], cfg: PipelineConfig, model_states: Dict[str, Any], output_dirs: Dict[str, Path]):
+    """Process one location and write final minimap/stitch/table artifacts."""
     image_results = []
     bev_stack = []
     rgb_stack = []
@@ -1342,6 +1496,11 @@ def process_location(location_name: str, image_paths: Sequence[Path], cfg: Pipel
 
 
 def run_pipeline(cfg: PipelineConfig, summary: Dict[str, Any], model_states: Dict[str, Any]) -> Dict[str, Any]:
+    """Run full pipeline over selected dataset locations.
+
+    Supports small-demo mode where ``demo_images_per_location=None`` means
+    "use all images for selected locations".
+    """
     output_dirs = ensure_output_dirs(cfg.output_dir, clean_output_dir=cfg.clean_output_dir)
 
     location_names = summary["locations"]
@@ -1394,6 +1553,7 @@ def run_pipeline(cfg: PipelineConfig, summary: Dict[str, Any], model_states: Dic
 
 
 def default_model_states(cfg: Optional[PipelineConfig] = None, device: Optional[str] = None) -> Dict[str, Any]:
+    """Initialize all model states with graceful fallbacks."""
     resolved = device or default_device()
     if cfg is None:
         tmp_root = Path(".")
@@ -1403,4 +1563,20 @@ def default_model_states(cfg: Optional[PipelineConfig] = None, device: Optional[
         "depth": init_depth_model(device=resolved),
         "det": init_instance_detector(device=resolved),
         "det_zero_shot": init_zero_shot_detector(cfg, device=resolved),
+    }
+
+
+def summarize_detection_table(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Summarize final detection rows by class and direction index."""
+    by_class: Dict[str, int] = {}
+    by_direction: Dict[int, int] = {}
+    for row in rows:
+        cls = normalize_class_name(row.get("class_name", "unknown"))
+        by_class[cls] = by_class.get(cls, 0) + 1
+        d = int(row.get("direction_index", -1))
+        by_direction[d] = by_direction.get(d, 0) + 1
+    return {
+        "final_detection_count": len(rows),
+        "detections_per_class": dict(sorted(by_class.items())),
+        "detections_per_direction": dict(sorted(by_direction.items())),
     }
