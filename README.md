@@ -72,6 +72,7 @@ Then open `final-project-cse5509-v2.ipynb` and run top-to-bottom.
   - `zero_shot_box_threshold = 0.35`
   - `zero_shot_text_threshold = 0.30`
 - FOV is configurable (`horizontal_fov_deg`) and affects projection geometry.
+- Per-image BEV diagnostics use automatic pixel scaling so the 0–10 relative range fills the high-resolution canvas.
 - Demo mode:
   - `run_small_demo=True`, `demo_locations=1`, `demo_images_per_location=None` uses all images in first location.
 

@@ -62,9 +62,9 @@ class PipelineConfig:
 
     # Per-image BEV diagnostic settings (stitched later for diagnostics).
     bev_max_range: float = 10.0
-    bev_scale_px_per_range_unit: float = 18.0
-    bev_height_px: int = 1100
-    bev_width_px: int = 1100
+    bev_scale_px_per_range_unit: Optional[float] = None
+    bev_height_px: int = 1400
+    bev_width_px: int = 2000
 
     # Minimap settings (primary output).
     minimap_size_px: int = 1400
@@ -783,8 +783,10 @@ def build_bev(seg_result: Dict[str, Any], depth_result: Dict[str, Any], cfg: Pip
     dist = normalized_depth_to_distance(depth, cfg.min_relative_range, cfg.max_relative_range, inverse=cfg.depth_is_inverse)
 
     bev = np.zeros((cfg.bev_height_px, cfg.bev_width_px, 3), dtype=np.uint8)
+    scale = bev_scale_px_per_range_unit(cfg)
+    bottom_margin_px = 40
     ego_x = cfg.bev_width_px // 2
-    ego_y = cfg.bev_height_px - 40
+    ego_y = cfg.bev_height_px - bottom_margin_px
 
     ys, xs = np.where(ground | obstacles)
     for y, x in zip(ys[::2], xs[::2]):
@@ -793,8 +795,8 @@ def build_bev(seg_result: Dict[str, Any], depth_result: Dict[str, Any], cfg: Pip
             continue
         x_cam = (x - intr["cx"]) / intr["fx"] * z_forward
 
-        bev_x = int(round(ego_x + x_cam * cfg.bev_scale_px_per_range_unit))
-        bev_y = int(round(ego_y - z_forward * cfg.bev_scale_px_per_range_unit))
+        bev_x = int(round(ego_x + x_cam * scale))
+        bev_y = int(round(ego_y - z_forward * scale))
         if 0 <= bev_x < cfg.bev_width_px and 0 <= bev_y < cfg.bev_height_px:
             bev[bev_y, bev_x] = (60, 170, 60) if ground[y, x] else (200, 90, 60)
 
@@ -808,11 +810,12 @@ def draw_bev_guides(bev, ego_x: int, ego_y: int, cfg: PipelineConfig) -> None:
     if cv2 is None:
         return
 
+    scale = bev_scale_px_per_range_unit(cfg)
     cv2.circle(bev, (ego_x, ego_y), 8, (255, 255, 255), -1)
     cv2.arrowedLine(bev, (ego_x, ego_y), (ego_x, max(5, ego_y - 70)), (255, 255, 0), 2, tipLength=0.2)
 
     for rel in [2, 4, 6, 8, 10]:
-        r = int(rel * cfg.bev_scale_px_per_range_unit)
+        r = int(rel * scale)
         y = ego_y - r
         if y > 0:
             cv2.ellipse(bev, (ego_x, ego_y), (r, r), 0, 180, 360, (80, 80, 80), 1)
@@ -823,6 +826,7 @@ def add_instance_markers(bev_result: Dict[str, Any], instances: List[Dict[str, A
     """Overlay detected instance markers on a BEV diagnostic image."""
     bev = bev_result["bev"]
     ego_x, ego_y = bev_result["ego_xy"]
+    scale = bev_scale_px_per_range_unit(cfg)
     intr = get_intrinsics(depth_m.shape[1], depth_m.shape[0], cfg.horizontal_fov_deg)
 
     cv2 = get_cv2()
@@ -836,8 +840,8 @@ def add_instance_markers(bev_result: Dict[str, Any], instances: List[Dict[str, A
         iy = int(max(0, min(depth_m.shape[0] - 1, round(cy))))
         z_forward = float(depth_m[iy, ix])
         x_cam = (cx - intr["cx"]) / intr["fx"] * z_forward
-        bev_x = int(round(ego_x + x_cam * cfg.bev_scale_px_per_range_unit))
-        bev_y = int(round(ego_y - z_forward * cfg.bev_scale_px_per_range_unit))
+        bev_x = int(round(ego_x + x_cam * scale))
+        bev_y = int(round(ego_y - z_forward * scale))
 
         inst["estimated_relative_range"] = z_forward
         inst["bev_xy"] = (bev_x, bev_y)
@@ -929,6 +933,23 @@ def rotate_camera_relative_to_ego(lateral_x_units: float, forward_units: float, 
     """Rotate camera-relative coordinates into ego/world relative units."""
     _ = cfg
     return rotate_clockwise_from_camera_to_ego(lateral_x_units, forward_units, heading_deg)
+
+
+def bev_scale_px_per_range_unit(cfg: PipelineConfig) -> float:
+    """Return BEV pixel-per-relative-unit scale."""
+    if cfg.bev_scale_px_per_range_unit is not None:
+        return cfg.bev_scale_px_per_range_unit
+
+    top_margin_px = 60
+    bottom_margin_px = 40
+    side_margin_px = 60
+    ego_y = cfg.bev_height_px - bottom_margin_px
+
+    vertical_scale = (ego_y - top_margin_px) / max(cfg.bev_max_range, 1e-6)
+    half_fov_rad = math.radians(cfg.horizontal_fov_deg / 2.0)
+    lateral_extent = cfg.bev_max_range * math.tan(half_fov_rad)
+    horizontal_scale = ((cfg.bev_width_px / 2.0) - side_margin_px) / max(lateral_extent, 1e-6)
+    return max(1.0, min(vertical_scale, horizontal_scale))
 
 
 def minimap_scale_px_per_range_unit(cfg: PipelineConfig) -> float:
@@ -1191,7 +1212,7 @@ def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: Pipel
     if len(bev_images) == 0:
         raise ValueError("No BEV images provided for stitching")
 
-    output_scale = cfg.bev_scale_px_per_range_unit
+    output_scale = bev_scale_px_per_range_unit(cfg)
     radius_px = int(math.ceil(cfg.bev_max_range * output_scale))
     canvas_size = max(bev_images[0].shape[0], bev_images[0].shape[1], 2 * radius_px + 1)
     center = canvas_size // 2
@@ -1203,7 +1224,8 @@ def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: Pipel
         bev_u8 = bev.astype(np.uint8)
         h, w = bev_u8.shape[:2]
         src_ego_x = w // 2
-        src_ego_y = h - 40
+        bottom_margin_px = 40
+        src_ego_y = h - bottom_margin_px
 
         ys, xs = np.where(np.any(bev_u8 > 20, axis=2))
         if ys.size == 0:
