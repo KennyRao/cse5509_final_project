@@ -56,20 +56,20 @@ class PipelineConfig:
     # Xiaomi 13 main camera is ~23mm equivalent; ~76° horizontal FOV is a
     # practical starting point for 1x captures. Ultra-wide shots need larger FOV.
     horizontal_fov_deg: float = 76.0
-    min_depth_m: float = 2.0
-    max_depth_m: float = 40.0
+    min_relative_range: float = 0.0
+    max_relative_range: float = 10.0
     depth_is_inverse: bool = True
 
     # Per-image BEV diagnostic settings (stitched later for diagnostics).
-    bev_max_distance_m: float = 40.0
-    bev_scale_px_per_m: float = 18.0
+    bev_max_range: float = 10.0
+    bev_scale_px_per_range_unit: float = 18.0
     bev_height_px: int = 1100
     bev_width_px: int = 1100
 
     # Minimap settings (primary output).
     minimap_size_px: int = 1400
-    minimap_max_distance_m: float = 40.0
-    minimap_scale_px_per_m: Optional[float] = None
+    minimap_max_range: float = 10.0
+    minimap_scale_px_per_range_unit: Optional[float] = None
     minimap_draw_dense_points: bool = True
     minimap_draw_object_labels: bool = True
     minimap_min_confidence: float = 0.70
@@ -77,7 +77,7 @@ class PipelineConfig:
     minimap_marker_alpha: float = 0.85
     minimap_jitter_overlapping_markers: bool = True
     minimap_merge_nearby_same_class: bool = True
-    minimap_merge_radius_m: float = 1.5
+    minimap_merge_radius_units: float = 0.75
     minimap_merge_radius_by_class: Optional[Dict[str, float]] = None
 
     stitched_draw_dense_points: bool = True
@@ -152,13 +152,13 @@ ZERO_SHOT_CLASS_ALIASES = {
     "traffic light": "road_sign",
 }
 DEDUP_RADIUS_BY_CLASS_DEFAULT = {
-    "person": 0.8,
-    "bicycle": 1.2,
-    "motorcycle": 1.2,
-    "car": 2.0,
-    "bus": 3.0,
-    "dumpster": 2.0,
-    "road_sign": 1.5,
+    "person": 0.9,
+    "bicycle": 0.45,
+    "motorcycle": 0.45,
+    "car": 0.75,
+    "bus": 1.0,
+    "dumpster": 0.65,
+    "road_sign": 0.5,
 }
 
 
@@ -748,12 +748,12 @@ def get_intrinsics(width: int, height: int, hfov_deg: float) -> Dict[str, float]
 
 
 def normalized_depth_to_distance(depth_norm, depth_min: float, depth_max: float, inverse: bool = True):
-    """Map normalized depth to approximate distance in meters.
+    """Map normalized depth to relative range units.
 
     Args:
         depth_norm: Normalized depth in [0, 1].
-        depth_min: Near distance bound in meters.
-        depth_max: Far distance bound in meters.
+        depth_min: Near bound in relative units.
+        depth_max: Far bound in relative units.
         inverse: When ``True`` treat larger normalized values as nearer
             (DPT-style inverse-depth assumption).
     """
@@ -780,7 +780,7 @@ def build_bev(seg_result: Dict[str, Any], depth_result: Dict[str, Any], cfg: Pip
 
     h, w = depth.shape
     intr = get_intrinsics(w, h, cfg.horizontal_fov_deg)
-    dist = normalized_depth_to_distance(depth, cfg.min_depth_m, cfg.max_depth_m, inverse=cfg.depth_is_inverse)
+    dist = normalized_depth_to_distance(depth, cfg.min_relative_range, cfg.max_relative_range, inverse=cfg.depth_is_inverse)
 
     bev = np.zeros((cfg.bev_height_px, cfg.bev_width_px, 3), dtype=np.uint8)
     ego_x = cfg.bev_width_px // 2
@@ -789,17 +789,17 @@ def build_bev(seg_result: Dict[str, Any], depth_result: Dict[str, Any], cfg: Pip
     ys, xs = np.where(ground | obstacles)
     for y, x in zip(ys[::2], xs[::2]):
         z_forward = float(dist[y, x])
-        if z_forward <= 0.01 or z_forward > cfg.bev_max_distance_m:
+        if z_forward <= 0.01 or z_forward > cfg.bev_max_range:
             continue
         x_cam = (x - intr["cx"]) / intr["fx"] * z_forward
 
-        bev_x = int(round(ego_x + x_cam * cfg.bev_scale_px_per_m))
-        bev_y = int(round(ego_y - z_forward * cfg.bev_scale_px_per_m))
+        bev_x = int(round(ego_x + x_cam * cfg.bev_scale_px_per_range_unit))
+        bev_y = int(round(ego_y - z_forward * cfg.bev_scale_px_per_range_unit))
         if 0 <= bev_x < cfg.bev_width_px and 0 <= bev_y < cfg.bev_height_px:
             bev[bev_y, bev_x] = (60, 170, 60) if ground[y, x] else (200, 90, 60)
 
     draw_bev_guides(bev, ego_x, ego_y, cfg)
-    return {"bev": bev, "ego_xy": (ego_x, ego_y), "distance_m": dist}
+    return {"bev": bev, "ego_xy": (ego_x, ego_y), "distance_units": dist}
 
 
 def draw_bev_guides(bev, ego_x: int, ego_y: int, cfg: PipelineConfig) -> None:
@@ -811,12 +811,12 @@ def draw_bev_guides(bev, ego_x: int, ego_y: int, cfg: PipelineConfig) -> None:
     cv2.circle(bev, (ego_x, ego_y), 8, (255, 255, 255), -1)
     cv2.arrowedLine(bev, (ego_x, ego_y), (ego_x, max(5, ego_y - 70)), (255, 255, 0), 2, tipLength=0.2)
 
-    for meters in [5, 10, 20, 30, 40]:
-        r = int(meters * cfg.bev_scale_px_per_m)
+    for rel in [2, 4, 6, 8, 10]:
+        r = int(rel * cfg.bev_scale_px_per_range_unit)
         y = ego_y - r
         if y > 0:
             cv2.ellipse(bev, (ego_x, ego_y), (r, r), 0, 180, 360, (80, 80, 80), 1)
-            cv2.putText(bev, f"{meters}m", (ego_x + 5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+            cv2.putText(bev, f"{rel} rel", (ego_x + 5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
 
 def add_instance_markers(bev_result: Dict[str, Any], instances: List[Dict[str, Any]], depth_m, cfg: PipelineConfig):
@@ -836,10 +836,10 @@ def add_instance_markers(bev_result: Dict[str, Any], instances: List[Dict[str, A
         iy = int(max(0, min(depth_m.shape[0] - 1, round(cy))))
         z_forward = float(depth_m[iy, ix])
         x_cam = (cx - intr["cx"]) / intr["fx"] * z_forward
-        bev_x = int(round(ego_x + x_cam * cfg.bev_scale_px_per_m))
-        bev_y = int(round(ego_y - z_forward * cfg.bev_scale_px_per_m))
+        bev_x = int(round(ego_x + x_cam * cfg.bev_scale_px_per_range_unit))
+        bev_y = int(round(ego_y - z_forward * cfg.bev_scale_px_per_range_unit))
 
-        inst["estimated_depth_m"] = z_forward
+        inst["estimated_relative_range"] = z_forward
         inst["bev_xy"] = (bev_x, bev_y)
 
         if 0 <= bev_x < cfg.bev_width_px and 0 <= bev_y < cfg.bev_height_px:
@@ -855,7 +855,7 @@ def add_instance_markers(bev_result: Dict[str, Any], instances: List[Dict[str, A
                 "bbox": [round(v, 2) for v in inst["bbox"]],
                 "center_xy": [round(v, 2) for v in inst["center_xy"]],
                 "contact_xy": [round(v, 2) for v in inst["contact_xy"]],
-                "estimated_depth_m": round(float(z_forward), 3),
+                "estimated_relative_range": round(float(z_forward), 3),
                 "bev_xy": [int(bev_x), int(bev_y)],
             }
         )
@@ -903,12 +903,12 @@ def estimate_camera_relative_position(instance: Dict[str, Any], image_width: int
     Uses the bounding-box bottom-center x-position and estimated depth.
     """
     contact_x = float(instance["contact_xy"][0])
-    depth_m = float(instance["estimated_depth_m"])
+    depth_m = float(instance["estimated_relative_range"])
     normalized_x = (contact_x - image_width / 2.0) / (image_width / 2.0)
     angle_offset_deg = normalized_x * (cfg.horizontal_fov_deg / 2.0)
-    lateral_x_m = depth_m * math.tan(math.radians(angle_offset_deg))
-    forward_m = depth_m
-    return lateral_x_m, forward_m
+    lateral_x_units = depth_m * math.tan(math.radians(angle_offset_deg))
+    forward_units = depth_m
+    return lateral_x_units, forward_units
 
 
 def direction_vector_from_heading(heading_deg: float) -> Tuple[float, float]:
@@ -917,34 +917,34 @@ def direction_vector_from_heading(heading_deg: float) -> Tuple[float, float]:
     return math.sin(theta), math.cos(theta)
 
 
-def rotate_clockwise_from_camera_to_ego(lateral_x_m: float, forward_m: float, heading_deg: float) -> Tuple[float, float]:
+def rotate_clockwise_from_camera_to_ego(lateral_x_units: float, forward_units: float, heading_deg: float) -> Tuple[float, float]:
     """Rotate camera-local (x right, y forward) into ego/world (x right, y forward)."""
     theta = math.radians(heading_deg)
-    ego_x = lateral_x_m * math.cos(theta) + forward_m * math.sin(theta)
-    ego_y = -lateral_x_m * math.sin(theta) + forward_m * math.cos(theta)
+    ego_x = lateral_x_units * math.cos(theta) + forward_units * math.sin(theta)
+    ego_y = -lateral_x_units * math.sin(theta) + forward_units * math.cos(theta)
     return ego_x, ego_y
 
 
-def rotate_camera_relative_to_ego(lateral_x_m: float, forward_m: float, heading_deg: float, cfg: PipelineConfig) -> Tuple[float, float]:
-    """Rotate camera-relative meters into ego/world meters."""
+def rotate_camera_relative_to_ego(lateral_x_units: float, forward_units: float, heading_deg: float, cfg: PipelineConfig) -> Tuple[float, float]:
+    """Rotate camera-relative coordinates into ego/world relative units."""
     _ = cfg
-    return rotate_clockwise_from_camera_to_ego(lateral_x_m, forward_m, heading_deg)
+    return rotate_clockwise_from_camera_to_ego(lateral_x_units, forward_units, heading_deg)
 
 
-def minimap_scale_px_per_m(cfg: PipelineConfig) -> float:
-    """Return minimap pixel-per-meter scale."""
-    if cfg.minimap_scale_px_per_m is not None:
-        return cfg.minimap_scale_px_per_m
-    return (cfg.minimap_size_px * 0.48) / cfg.minimap_max_distance_m
+def minimap_scale_px_per_range_unit(cfg: PipelineConfig) -> float:
+    """Return minimap pixel-per-relative-unit scale."""
+    if cfg.minimap_scale_px_per_range_unit is not None:
+        return cfg.minimap_scale_px_per_range_unit
+    return (cfg.minimap_size_px * 0.48) / cfg.minimap_max_range
 
 
-def ego_meters_to_minimap_px(x_m: float, y_m: float, cfg: PipelineConfig) -> Tuple[int, int]:
-    """Convert ego-frame meters to minimap pixel coordinates."""
+def ego_meters_to_minimap_px(x_units: float, y_units: float, cfg: PipelineConfig) -> Tuple[int, int]:
+    """Convert ego-frame relative units to minimap pixel coordinates."""
     # Ego/world: +x right, +y forward. Image y increases downward.
-    scale = minimap_scale_px_per_m(cfg)
+    scale = minimap_scale_px_per_range_unit(cfg)
     c = cfg.minimap_size_px // 2
-    px = int(round(c + x_m * scale))
-    py = int(round(c - y_m * scale))
+    px = int(round(c + x_units * scale))
+    py = int(round(c - y_units * scale))
     return px, py
 
 
@@ -955,17 +955,17 @@ def draw_minimap_guides(canvas, cfg: PipelineConfig) -> None:
         return
 
     c = cfg.minimap_size_px // 2
-    scale = minimap_scale_px_per_m(cfg)
-    ring_m = [5, 10, 20, 30, 40]
+    scale = minimap_scale_px_per_range_unit(cfg)
+    ring_units = [2, 4, 6, 8, 10]
 
     cv2.circle(canvas, (c, c), 9, (255, 255, 255), -1)
     cv2.arrowedLine(canvas, (c, c), (c, c - 70), (0, 255, 255), 3, tipLength=0.25)
     cv2.putText(canvas, "dir0", (c + 8, c - 78), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 2)
 
-    for meters in ring_m:
-        r = int(meters * scale)
+    for rel in ring_units:
+        r = int(rel * scale)
         cv2.circle(canvas, (c, c), r, (75, 75, 75), 1)
-        cv2.putText(canvas, f"{meters}m", (c + 6, c - r - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        cv2.putText(canvas, f"{rel} rel", (c + 6, c - r - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
     for i in range(8):
         heading = heading_for_direction(i, cfg)
@@ -976,7 +976,7 @@ def draw_minimap_guides(canvas, cfg: PipelineConfig) -> None:
         cv2.putText(canvas, f"dir{i}", (x - 15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1)
 
 
-def draw_stitched_bev_guides(canvas, center_px: int, scale_px_per_m: float, max_distance_m: float, cfg: PipelineConfig) -> None:
+def draw_stitched_bev_guides(canvas, center_px: int, scale_px_per_range_unit: float, max_distance_units: float, cfg: PipelineConfig) -> None:
     """Draw rings/spokes on stitched BEV diagnostic canvas."""
     cv2 = get_cv2()
     if cv2 is None:
@@ -986,13 +986,13 @@ def draw_stitched_bev_guides(canvas, center_px: int, scale_px_per_m: float, max_
     cv2.arrowedLine(canvas, (center_px, center_px), (center_px, int(round(center_px - 0.22 * canvas.shape[0]))), (0, 190, 190), 1, tipLength=0.2)
     cv2.putText(canvas, "dir0", (center_px + 6, int(round(center_px - 0.24 * canvas.shape[0]))), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1)
 
-    for meters in [5, 10, 20, 30, 40]:
-        if meters > max_distance_m:
+    for rel in [2, 4, 6, 8, 10]:
+        if rel > max_distance_units:
             continue
-        radius = int(round(meters * scale_px_per_m))
+        radius = int(round(rel * scale_px_per_range_unit))
         cv2.circle(canvas, (center_px, center_px), radius, (58, 58, 58), 1)
 
-    spoke_radius = int(round(max_distance_m * scale_px_per_m))
+    spoke_radius = int(round(max_distance_units * scale_px_per_range_unit))
     for i in range(8):
         theta = math.radians(heading_for_direction(i, cfg))
         spoke_x = int(round(center_px + math.sin(theta) * spoke_radius))
@@ -1012,13 +1012,13 @@ def render_direction_debug_plot(cfg: PipelineConfig, output_path: Path) -> Path:
     return output_path
 
 
-def _bearing_deg(x_m: float, y_m: float) -> float:
+def _bearing_deg(x_units: float, y_units: float) -> float:
     """Return clockwise bearing degrees from +y for ego-frame coordinates."""
-    return (math.degrees(math.atan2(x_m, y_m)) + 360.0) % 360.0
+    return (math.degrees(math.atan2(x_units, y_units)) + 360.0) % 360.0
 
 
 def deduplicate_location_rows(rows: List[Dict[str, Any]], cfg: PipelineConfig) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Heuristically deduplicate projected objects in ego-meter space.
+    """Heuristically deduplicate projected objects in ego-frame relative-unit space.
 
     This is location-level class-aware NMS using distance radii. It reduces
     repeated detections across overlapping directions but does not prove two
@@ -1035,19 +1035,19 @@ def deduplicate_location_rows(rows: List[Dict[str, Any]], cfg: PipelineConfig) -
     suppressed_records: List[Dict[str, Any]] = []
     for row in sorted(rows, key=lambda r: -float(r["confidence"])):
         cls = normalize_class_name(row["class_name"])
-        threshold_m = float(radius_by_class.get(cls, cfg.minimap_merge_radius_m))
+        threshold_units = float(radius_by_class.get(cls, cfg.minimap_merge_radius_units))
         suppressed = False
         for existing in kept:
             if normalize_class_name(existing["class_name"]) != cls:
                 continue
-            distance_m = float(math.hypot(row["ego_x_m"] - existing["ego_x_m"], row["ego_y_m"] - existing["ego_y_m"]))
-            if distance_m <= threshold_m:
+            distance_units = float(math.hypot(row["ego_x_units"] - existing["ego_x_units"], row["ego_y_units"] - existing["ego_y_units"]))
+            if distance_units <= threshold_units:
                 suppressed = True
                 suppressed_records.append(
                     {
                         "class_name": cls,
-                        "distance_m": round(distance_m, 4),
-                        "threshold_m": round(threshold_m, 4),
+                        "distance_units": round(distance_units, 4),
+                        "threshold_units": round(threshold_units, 4),
                         "kept_label": existing.get("instance_label"),
                         "kept_source": existing.get("detector_source", "unknown"),
                         "kept_confidence": float(existing.get("confidence", 0.0)),
@@ -1095,7 +1095,7 @@ def render_location_minimap(location_name: str, rows: List[Dict[str, Any]], cfg:
     canvas[:] = (20, 20, 20)
     draw_minimap_guides(canvas, cfg)
 
-    rows_for_labels = sorted(rows, key=lambda r: (-r["confidence"], r["range_m"]))[: cfg.minimap_label_top_k_per_location]
+    rows_for_labels = sorted(rows, key=lambda r: (-r["confidence"], r["range_units"]))[: cfg.minimap_label_top_k_per_location]
     label_keys = {(r["source_image"], r["instance_label"]) for r in rows_for_labels}
 
     occupancy: Dict[Tuple[int, int], int] = {}
@@ -1125,6 +1125,7 @@ def render_location_minimap(location_name: str, rows: List[Dict[str, Any]], cfg:
             cv2.putText(canvas, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (240, 240, 240), 2)
 
     cv2.putText(canvas, f"{location_name} minimap (ego-centered)", (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(canvas, "distance scale: relative DPT units", (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1)
 
     legend_items = ["person", "car", "bus", "motorcycle", "bicycle", "dumpster", "road_sign"]
     lx, ly = 20, cfg.minimap_size_px - 220
@@ -1153,13 +1154,13 @@ def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "bbox": [round(v, 2) for v in row["bbox"]],
         "center_xy": [round(v, 2) for v in row["center_xy"]],
         "contact_xy": [round(v, 2) for v in row["contact_xy"]],
-        "estimated_depth_m": round(row["estimated_depth_m"], 3),
-        "camera_lateral_x_m": round(row["camera_lateral_x_m"], 3),
-        "camera_forward_m": round(row["camera_forward_m"], 3),
-        "ego_x_m": round(row["ego_x_m"], 3),
-        "ego_y_m": round(row["ego_y_m"], 3),
+        "estimated_relative_range": round(row["estimated_relative_range"], 3),
+        "camera_lateral_x_units": round(row["camera_lateral_x_units"], 3),
+        "camera_forward_units": round(row["camera_forward_units"], 3),
+        "ego_x_units": round(row["ego_x_units"], 3),
+        "ego_y_units": round(row["ego_y_units"], 3),
         "bearing_deg": round(row["bearing_deg"], 3),
-        "range_m": round(row["range_m"], 3),
+        "range_units": round(row["range_units"], 3),
         "minimap_xy": [int(row["minimap_xy"][0]), int(row["minimap_xy"][1])],
         "clipped_to_minimap": bool(row["clipped_to_minimap"]),
     }
@@ -1190,8 +1191,8 @@ def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: Pipel
     if len(bev_images) == 0:
         raise ValueError("No BEV images provided for stitching")
 
-    output_scale = cfg.bev_scale_px_per_m
-    radius_px = int(math.ceil(cfg.bev_max_distance_m * output_scale))
+    output_scale = cfg.bev_scale_px_per_range_unit
+    radius_px = int(math.ceil(cfg.bev_max_range * output_scale))
     canvas_size = max(bev_images[0].shape[0], bev_images[0].shape[1], 2 * radius_px + 1)
     center = canvas_size // 2
     accum = np.zeros((canvas_size, canvas_size, 3), dtype=np.float32)
@@ -1209,17 +1210,17 @@ def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: Pipel
             diagnostics.append({"view": labels[idx], "valid_pixels": 0, "status": "no_valid_pixels"})
             continue
 
-        local_x_m = (xs.astype(np.float32) - src_ego_x) / output_scale
-        local_y_m = (src_ego_y - ys.astype(np.float32)) / output_scale
+        local_x_units = (xs.astype(np.float32) - src_ego_x) / output_scale
+        local_y_units = (src_ego_y - ys.astype(np.float32)) / output_scale
 
         direction_idx = extract_direction_index(labels[idx])
         if direction_idx is None:
             direction_idx = idx
         heading_deg = heading_for_direction(direction_idx, cfg)
-        world_x_m, world_y_m = rotate_clockwise_from_camera_to_ego(local_x_m, local_y_m, heading_deg)
+        world_x_units, world_y_units = rotate_clockwise_from_camera_to_ego(local_x_units, local_y_units, heading_deg)
 
-        out_x = np.rint(center + world_x_m * output_scale).astype(np.int32)
-        out_y = np.rint(center - world_y_m * output_scale).astype(np.int32)
+        out_x = np.rint(center + world_x_units * output_scale).astype(np.int32)
+        out_y = np.rint(center - world_y_units * output_scale).astype(np.int32)
         in_bounds = (out_x >= 0) & (out_x < canvas_size) & (out_y >= 0) & (out_y < canvas_size)
         if not np.any(in_bounds):
             diagnostics.append({"view": labels[idx], "valid_pixels": int(ys.size), "painted_pixels": 0, "heading_deg": round(heading_deg, 1)})
@@ -1251,7 +1252,7 @@ def compose_location_bev(bev_images: Sequence, labels: Sequence[str], cfg: Pipel
     stitched = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
     painted = counts > 0
     stitched[painted] = np.clip(accum[painted] / counts[painted, None], 0, 255).astype(np.uint8)
-    draw_stitched_bev_guides(stitched, center, output_scale, cfg.bev_max_distance_m, cfg)
+    draw_stitched_bev_guides(stitched, center, output_scale, cfg.bev_max_range, cfg)
 
     return stitched, diagnostics
 
@@ -1338,7 +1339,7 @@ def process_image(image_path: Path, cfg: PipelineConfig, model_states: Dict[str,
     assert_unique_labels(instances)
 
     bev_res = build_bev(seg, depth, cfg)
-    bev_img, _ = add_instance_markers(bev_res, instances, bev_res["distance_m"], cfg)
+    bev_img, _ = add_instance_markers(bev_res, instances, bev_res["distance_units"], cfg)
     overlay = draw_detection_overlay(image, instances)
 
     stem = image_path.stem.replace(" ", "_")
@@ -1359,7 +1360,7 @@ def process_image(image_path: Path, cfg: PipelineConfig, model_states: Dict[str,
     save_array_image(output_dirs["diagnostics"] / f"{loc}_{stem}_object_mask.png", obj_vis)
 
     h, w = image.size[1], image.size[0]
-    distance_m = normalized_depth_to_distance(depth["depth"], cfg.min_depth_m, cfg.max_depth_m, inverse=cfg.depth_is_inverse)
+    distance_units = normalized_depth_to_distance(depth["depth"], cfg.min_relative_range, cfg.max_relative_range, inverse=cfg.depth_is_inverse)
     direction_index = extract_direction_index(image_path.name)
     if direction_index is None:
         direction_index = 0
@@ -1373,23 +1374,23 @@ def process_image(image_path: Path, cfg: PipelineConfig, model_states: Dict[str,
         cx, cy = inst["contact_xy"]
         ix = int(max(0, min(w - 1, round(cx))))
         iy = int(max(0, min(h - 1, round(cy))))
-        depth_m = float(distance_m[iy, ix])
-        depth_m = max(cfg.min_depth_m, min(cfg.max_depth_m, depth_m))
-        inst["estimated_depth_m"] = depth_m
+        depth_m = float(distance_units[iy, ix])
+        depth_m = max(cfg.min_relative_range, min(cfg.max_relative_range, depth_m))
+        inst["estimated_relative_range"] = depth_m
 
-        cam_x_m, cam_y_m = estimate_camera_relative_position(inst, w, cfg)
-        ego_x_m, ego_y_m = rotate_camera_relative_to_ego(cam_x_m, cam_y_m, heading_deg, cfg)
-        range_m = math.hypot(ego_x_m, ego_y_m)
-        bearing_deg = _bearing_deg(ego_x_m, ego_y_m)
+        cam_x_units, cam_y_units = estimate_camera_relative_position(inst, w, cfg)
+        ego_x_units, ego_y_units = rotate_camera_relative_to_ego(cam_x_units, cam_y_units, heading_deg, cfg)
+        range_units = math.hypot(ego_x_units, ego_y_units)
+        bearing_deg = _bearing_deg(ego_x_units, ego_y_units)
 
-        px, py = ego_meters_to_minimap_px(ego_x_m, ego_y_m, cfg)
+        px, py = ego_meters_to_minimap_px(ego_x_units, ego_y_units, cfg)
         clipped = False
-        if range_m > cfg.minimap_max_distance_m:
+        if range_units > cfg.minimap_max_range:
             clipped = True
-            s = cfg.minimap_max_distance_m / max(range_m, 1e-6)
-            ego_x_m *= s
-            ego_y_m *= s
-            px, py = ego_meters_to_minimap_px(ego_x_m, ego_y_m, cfg)
+            s = cfg.minimap_max_range / max(range_units, 1e-6)
+            ego_x_units *= s
+            ego_y_units *= s
+            px, py = ego_meters_to_minimap_px(ego_x_units, ego_y_units, cfg)
 
         row = {
             "source_image": image_path.name,
@@ -1403,13 +1404,13 @@ def process_image(image_path: Path, cfg: PipelineConfig, model_states: Dict[str,
             "bbox": list(inst["bbox"]),
             "center_xy": list(inst["center_xy"]),
             "contact_xy": list(inst["contact_xy"]),
-            "estimated_depth_m": depth_m,
-            "camera_lateral_x_m": cam_x_m,
-            "camera_forward_m": cam_y_m,
-            "ego_x_m": ego_x_m,
-            "ego_y_m": ego_y_m,
+            "estimated_relative_range": depth_m,
+            "camera_lateral_x_units": cam_x_units,
+            "camera_forward_units": cam_y_units,
+            "ego_x_units": ego_x_units,
+            "ego_y_units": ego_y_units,
             "bearing_deg": bearing_deg,
-            "range_m": range_m,
+            "range_units": range_units,
             "minimap_xy": [int(px), int(py)],
             "clipped_to_minimap": clipped,
         }
@@ -1533,10 +1534,10 @@ def run_pipeline(cfg: PipelineConfig, summary: Dict[str, Any], model_states: Dic
     report = {
         "config": {
             "horizontal_fov_deg": cfg.horizontal_fov_deg,
-            "min_depth_m": cfg.min_depth_m,
-            "max_depth_m": cfg.max_depth_m,
+            "min_relative_range": cfg.min_relative_range,
+            "max_relative_range": cfg.max_relative_range,
             "minimap_size_px": cfg.minimap_size_px,
-            "minimap_max_distance_m": cfg.minimap_max_distance_m,
+            "minimap_max_range": cfg.minimap_max_range,
             "direction_zero_heading_deg": cfg.direction_zero_heading_deg,
             "direction_step_deg": cfg.direction_step_deg,
             "direction_turn": cfg.direction_turn,
