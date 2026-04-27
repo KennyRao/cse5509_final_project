@@ -65,7 +65,7 @@ class PipelineConfig:
     direction_step_deg: float = 45.0
     direction_turn: str = "right"
 
-    detection_threshold: float = 0.7
+    detection_threshold: float = 0.75
     use_homography_diagnostics: bool = True
     use_zero_shot_detector: bool = True
     zero_shot_model_name: str = "IDEA-Research/grounding-dino-tiny"
