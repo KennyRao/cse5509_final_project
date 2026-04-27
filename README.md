@@ -40,8 +40,8 @@ The pipeline expects `repo_root/data/` (not `data/data/`).
 3. Run DPT monocular depth (approximate; treated as inverse depth by default).
 4. Run Mask R-CNN (+ optional Grounding DINO for open-vocabulary classes like `dumpster`, `road_sign`).
 5. Use bbox bottom-center as a ground-contact proxy.
-6. Project detections to ego meters using FOV + depth approximation.
-7. Apply image-space class-aware NMS, then location-level heuristic deduplication in ego-meter space.
+6. Project detections to ego-frame relative units using FOV + depth approximation.
+7. Apply image-space class-aware NMS, then location-level heuristic deduplication in ego-frame relative-unit space.
 8. Render final minimap from deduplicated rows.
 9. Render stitched BEV diagnostic from rotated per-image BEV pixels.
 
@@ -90,7 +90,7 @@ Then open `final-project-cse5509-v2.ipynb` and run top-to-bottom.
 
 ## 10) How to interpret the minimap
 - Center marker = ego position.
-- Rings = approximate distance intervals.
+- Rings = relative range intervals on a 0–10 scale.
 - Spokes/labels indicate direction convention.
 - Colored markers = object class.
 - Labels (e.g., `car1`) are unique after deduplication/relabeling.
@@ -101,7 +101,7 @@ Then open `final-project-cse5509-v2.ipynb` and run top-to-bottom.
 
 ## 12) Assumptions and limitations
 - Monocular depth is approximate and not calibrated metric depth.
-- DPT normalization is mapped to pseudo-metric distance via configured bounds.
+- The system uses DPT depth as a relative range cue and visualizes distance on a 0–10 relative scale. The scale is useful for comparing nearer and farther objects within a run, but it should not be interpreted as physical meters.
 - Object projection uses bbox bottom-center as ground-contact proxy.
 - FOV is approximate unless calibrated for the capture camera.
 - Deduplication is heuristic and reduces repeats; it does not prove object identity.

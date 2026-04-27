@@ -11,6 +11,7 @@ from bev_pipeline import (
     compute_alignment_diagnostics,
     compose_location_bev,
     deduplicate_location_rows,
+    draw_minimap_guides,
     ego_meters_to_minimap_px,
     extract_direction_index,
     heading_for_direction,
@@ -19,6 +20,7 @@ from bev_pipeline import (
     resolve_project_paths,
     render_location_minimap,
     run_pipeline,
+    _serialize_row,
     rotate_camera_relative_to_ego,
 )
 
@@ -34,6 +36,7 @@ def test_threshold_defaults_balanced_demo() -> None:
     assert cfg.minimap_min_confidence == 0.70
     assert cfg.zero_shot_box_threshold == 0.35
     assert cfg.zero_shot_text_threshold == 0.30
+    assert cfg.minimap_max_range == 10.0
 
 
 def test_direction_index_parsing() -> None:
@@ -86,8 +89,8 @@ def test_compose_location_bev_rotates_from_fixed_center() -> None:
     cfg = _cfg()
     cfg.bev_width_px = 100
     cfg.bev_height_px = 100
-    cfg.bev_scale_px_per_m = 10.0
-    cfg.bev_max_distance_m = 10.0
+    cfg.bev_scale_px_per_range_unit = 10.0
+    cfg.bev_max_range = 10.0
     ego_x = cfg.bev_width_px // 2
     ego_y = cfg.bev_height_px - 40
     patch_y = ego_y - 20  # 2m forward from source ego origin.
@@ -122,8 +125,8 @@ def test_compose_location_bev_ignores_black_overwrite() -> None:
     cfg = _cfg()
     cfg.bev_width_px = 100
     cfg.bev_height_px = 100
-    cfg.bev_scale_px_per_m = 10.0
-    cfg.bev_max_distance_m = 10.0
+    cfg.bev_scale_px_per_range_unit = 10.0
+    cfg.bev_max_range = 10.0
     ego_x = cfg.bev_width_px // 2
     ego_y = cfg.bev_height_px - 40
 
@@ -165,13 +168,13 @@ def test_minimap_rendering_synthetic(tmp_path: Path) -> None:
             'bbox': [0, 0, 1, 1],
             'center_xy': [0, 0],
             'contact_xy': [0, 0],
-            'estimated_depth_m': 10.0,
-            'camera_lateral_x_m': 0.0,
-            'camera_forward_m': 10.0,
-            'ego_x_m': 0.0,
-            'ego_y_m': 10.0,
+            'estimated_relative_range': 10.0,
+            'camera_lateral_x_units': 0.0,
+            'camera_forward_units': 10.0,
+            'ego_x_units': 0.0,
+            'ego_y_units': 10.0,
             'bearing_deg': 0.0,
-            'range_m': 10.0,
+            'range_units': 10.0,
             'minimap_xy': [cfg.minimap_size_px // 2, cfg.minimap_size_px // 2 - 100],
             'clipped_to_minimap': False,
         }
@@ -192,15 +195,20 @@ def test_resolve_project_paths_uses_repo_data_dir_only(tmp_path: Path) -> None:
 def test_depth_inverse_mapping() -> None:
     import numpy as np
 
-    d = normalized_depth_to_distance(np.array([0.0, 1.0]), 2.0, 40.0, inverse=True)
-    assert np.allclose(d, np.array([40.0, 2.0]), atol=1e-4)
+    d = normalized_depth_to_distance(np.array([0.0, 1.0]), 0.0, 10.0, inverse=True)
+    assert np.allclose(d, np.array([10.0, 0.0]), atol=1e-4)
+
+
+def test_depth_inverse_endpoints_relative_scale() -> None:
+    assert normalized_depth_to_distance(1.0, 0.0, 10.0, inverse=True) == 0.0
+    assert normalized_depth_to_distance(0.0, 0.0, 10.0, inverse=True) == 10.0
 
 
 def test_dedup_keeps_highest_confidence() -> None:
     cfg = _cfg()
     rows = [
-        {"class_name": "car", "confidence": 0.80, "ego_x_m": 0.0, "ego_y_m": 0.0, "instance_label": "car_old", "detector_source": "a"},
-        {"class_name": "car", "confidence": 0.95, "ego_x_m": 0.2, "ego_y_m": 0.0, "instance_label": "car_new", "detector_source": "b"},
+        {"class_name": "car", "confidence": 0.80, "ego_x_units": 0.0, "ego_y_units": 0.0, "instance_label": "car_old", "detector_source": "a"},
+        {"class_name": "car", "confidence": 0.95, "ego_x_units": 0.2, "ego_y_units": 0.0, "instance_label": "car_new", "detector_source": "b"},
     ]
     kept, _ = deduplicate_location_rows(rows, cfg)
     assert len(kept) == 1
@@ -221,11 +229,99 @@ def test_image_space_nms_keeps_highest_confidence_same_class() -> None:
 def test_dedup_does_not_merge_different_classes() -> None:
     cfg = _cfg()
     rows = [
-        {"class_name": "car", "confidence": 0.9, "ego_x_m": 0.0, "ego_y_m": 0.0, "instance_label": "car1", "detector_source": "a"},
-        {"class_name": "bus", "confidence": 0.85, "ego_x_m": 0.0, "ego_y_m": 0.0, "instance_label": "bus1", "detector_source": "b"},
+        {"class_name": "car", "confidence": 0.9, "ego_x_units": 0.0, "ego_y_units": 0.0, "instance_label": "car1", "detector_source": "a"},
+        {"class_name": "bus", "confidence": 0.85, "ego_x_units": 0.0, "ego_y_units": 0.0, "instance_label": "bus1", "detector_source": "b"},
     ]
     kept, _ = deduplicate_location_rows(rows, cfg)
     assert len(kept) == 2
+
+
+def test_dedup_diagnostics_uses_relative_unit_keys() -> None:
+    cfg = _cfg()
+    rows = [
+        {"class_name": "person", "confidence": 0.9, "ego_x_units": 0.0, "ego_y_units": 0.0, "instance_label": "person1", "detector_source": "a"},
+        {"class_name": "person", "confidence": 0.8, "ego_x_units": 0.4, "ego_y_units": 0.0, "instance_label": "person2", "detector_source": "b"},
+    ]
+    _, suppressed = deduplicate_location_rows(rows, cfg)
+    assert len(suppressed) == 1
+    assert "distance_units" in suppressed[0]
+    assert "threshold_units" in suppressed[0]
+    assert "distance_m" not in suppressed[0]
+    assert "threshold_m" not in suppressed[0]
+
+
+def test_serialized_row_uses_relative_range_fields() -> None:
+    row = {
+        "source_image": "direction 0.jpg",
+        "location": "locX",
+        "direction_index": 0,
+        "heading_deg": 0.0,
+        "class_name": "car",
+        "detector_source": "mask_rcnn",
+        "instance_label": "car1",
+        "confidence": 0.95,
+        "bbox": [0.0, 0.0, 1.0, 1.0],
+        "center_xy": [0.5, 0.5],
+        "contact_xy": [0.5, 1.0],
+        "estimated_relative_range": 4.0,
+        "camera_lateral_x_units": 0.0,
+        "camera_forward_units": 4.0,
+        "ego_x_units": 0.0,
+        "ego_y_units": 4.0,
+        "bearing_deg": 0.0,
+        "range_units": 4.0,
+        "minimap_xy": [100, 100],
+        "clipped_to_minimap": False,
+    }
+    out = _serialize_row(row)
+    assert "estimated_relative_range" in out
+    assert "range_units" in out
+    assert "ego_x_units" in out
+    assert "ego_y_units" in out
+    assert "estimated_depth_m" not in out
+    assert "range_m" not in out
+
+
+def test_guide_labels_do_not_include_meter_suffix() -> None:
+    import importlib.util
+    if importlib.util.find_spec('numpy') is None:
+        return
+    import numpy as np
+    import bev_pipeline
+
+    drawn_text = []
+
+    class FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+
+        @staticmethod
+        def circle(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def arrowedLine(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def line(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def putText(_img, text, *_args, **_kwargs):
+            drawn_text.append(text)
+            return None
+
+    cfg = _cfg()
+    canvas = np.zeros((cfg.minimap_size_px, cfg.minimap_size_px, 3), dtype=np.uint8)
+    original = bev_pipeline.get_cv2
+    bev_pipeline.get_cv2 = lambda: FakeCV2
+    try:
+        draw_minimap_guides(canvas, cfg)
+    finally:
+        bev_pipeline.get_cv2 = original
+
+    assert any("rel" in t for t in drawn_text)
+    assert not any("m" in t for t in drawn_text if "dir" not in t)
 
 
 def test_alignment_diagnostics_accepts_rgb_images() -> None:
