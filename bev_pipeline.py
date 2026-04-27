@@ -502,7 +502,7 @@ def normalize_class_name(class_name: str) -> str:
 
 
 def _instance_iou_xyxy(a: Sequence[float], b: Sequence[float]) -> float:
-    """Compute IoU of two ``[x1, y1, x2, y2]`` boxes."""
+    """Compute intersection over union (IoU) of two ``[x1, y1, x2, y2]`` boxes."""
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)
