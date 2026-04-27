@@ -4,6 +4,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 from bev_pipeline import (
+    _dedup_image_space_instances,
     PipelineConfig,
     _post_process_grounding_dino,
     assign_instance_labels,
@@ -25,6 +26,14 @@ from bev_pipeline import (
 def _cfg() -> PipelineConfig:
     root = Path('.')
     return PipelineConfig(repo_root=root, data_dir=root / 'data', output_dir=root / 'outputs')
+
+
+def test_threshold_defaults_balanced_demo() -> None:
+    cfg = _cfg()
+    assert cfg.detection_threshold == 0.70
+    assert cfg.minimap_min_confidence == 0.70
+    assert cfg.zero_shot_box_threshold == 0.35
+    assert cfg.zero_shot_text_threshold == 0.30
 
 
 def test_direction_index_parsing() -> None:
@@ -198,6 +207,17 @@ def test_dedup_keeps_highest_confidence() -> None:
     assert kept[0]["confidence"] == 0.95
 
 
+def test_image_space_nms_keeps_highest_confidence_same_class() -> None:
+    instances = [
+        {"class_name": "car", "confidence": 0.80, "bbox": [0, 0, 10, 10]},
+        {"class_name": "car", "confidence": 0.95, "bbox": [1, 1, 11, 11]},
+        {"class_name": "person", "confidence": 0.70, "bbox": [1, 1, 11, 11]},
+    ]
+    kept = _dedup_image_space_instances(instances, iou_threshold=0.5)
+    assert len(kept) == 2
+    assert any(k["class_name"] == "car" and k["confidence"] == 0.95 for k in kept)
+
+
 def test_dedup_does_not_merge_different_classes() -> None:
     cfg = _cfg()
     rows = [
@@ -317,5 +337,6 @@ def test_normalize_class_name_zero_shot_variants() -> None:
     assert normalize_class_name("road sign.") == "road_sign"
     assert normalize_class_name("traffic sign") == "road_sign"
     assert normalize_class_name("stop sign") == "road_sign"
+    assert normalize_class_name("traffic light") == "road_sign"
     assert normalize_class_name("trash dumpster") == "dumpster"
     assert normalize_class_name("a car") == "car"
