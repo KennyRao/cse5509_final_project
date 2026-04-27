@@ -959,7 +959,7 @@ def minimap_scale_px_per_range_unit(cfg: PipelineConfig) -> float:
     return (cfg.minimap_size_px * 0.48) / cfg.minimap_max_range
 
 
-def ego_meters_to_minimap_px(x_units: float, y_units: float, cfg: PipelineConfig) -> Tuple[int, int]:
+def ego_units_to_minimap_px(x_units: float, y_units: float, cfg: PipelineConfig) -> Tuple[int, int]:
     """Convert ego-frame relative units to minimap pixel coordinates."""
     # Ego/world: +x right, +y forward. Image y increases downward.
     scale = minimap_scale_px_per_range_unit(cfg)
@@ -1405,14 +1405,14 @@ def process_image(image_path: Path, cfg: PipelineConfig, model_states: Dict[str,
         range_units = math.hypot(ego_x_units, ego_y_units)
         bearing_deg = _bearing_deg(ego_x_units, ego_y_units)
 
-        px, py = ego_meters_to_minimap_px(ego_x_units, ego_y_units, cfg)
+        px, py = ego_units_to_minimap_px(ego_x_units, ego_y_units, cfg)
         clipped = False
         if range_units > cfg.minimap_max_range:
             clipped = True
             s = cfg.minimap_max_range / max(range_units, 1e-6)
             ego_x_units *= s
             ego_y_units *= s
-            px, py = ego_meters_to_minimap_px(ego_x_units, ego_y_units, cfg)
+            px, py = ego_units_to_minimap_px(ego_x_units, ego_y_units, cfg)
 
         row = {
             "source_image": image_path.name,
@@ -1482,7 +1482,8 @@ def process_location(location_name: str, image_paths: Sequence[Path], cfg: Pipel
     render_direction_debug_plot(cfg, direction_debug_path)
 
     stitched, diagnostics = compose_location_bev(bev_stack, labels, cfg)
-    diagnostics.extend(compute_alignment_diagnostics(rgb_stack, labels))
+    if cfg.use_homography_diagnostics:
+        diagnostics.extend(compute_alignment_diagnostics(rgb_stack, labels))
     stitched_path = output_dirs["per_location"] / f"{location_name}_stitched_bev.png"
     save_array_image(stitched_path, stitched)
     save_json(output_dirs["tables"] / f"{location_name}_stitch_diagnostics.json", diagnostics)

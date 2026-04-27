@@ -13,7 +13,7 @@ from bev_pipeline import (
     compose_location_bev,
     deduplicate_location_rows,
     draw_minimap_guides,
-    ego_meters_to_minimap_px,
+    ego_units_to_minimap_px,
     extract_direction_index,
     heading_for_direction,
     normalized_depth_to_distance,
@@ -87,11 +87,11 @@ def test_rotation_and_minimap_axes() -> None:
     assert x1 > 0 and y1 > 0
     assert x2 > 0 and abs(y2) < 1e-6
     assert x6 < 0 and abs(y6) < 1e-6
-    cx, cy = ego_meters_to_minimap_px(0.0, 0.0, cfg)
-    p0 = ego_meters_to_minimap_px(x0, y0, cfg)
-    p1 = ego_meters_to_minimap_px(x1, y1, cfg)
-    p2 = ego_meters_to_minimap_px(x2, y2, cfg)
-    p6 = ego_meters_to_minimap_px(x6, y6, cfg)
+    cx, cy = ego_units_to_minimap_px(0.0, 0.0, cfg)
+    p0 = ego_units_to_minimap_px(x0, y0, cfg)
+    p1 = ego_units_to_minimap_px(x1, y1, cfg)
+    p2 = ego_units_to_minimap_px(x2, y2, cfg)
+    p6 = ego_units_to_minimap_px(x6, y6, cfg)
     assert p0[1] < cy
     assert p1[0] > cx and p1[1] < cy
     assert p2[0] > cx
