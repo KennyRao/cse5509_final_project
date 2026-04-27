@@ -8,6 +8,7 @@ from bev_pipeline import (
     PipelineConfig,
     _post_process_grounding_dino,
     assign_instance_labels,
+    bev_scale_px_per_range_unit,
     compute_alignment_diagnostics,
     compose_location_bev,
     deduplicate_location_rows,
@@ -37,6 +38,23 @@ def test_threshold_defaults_balanced_demo() -> None:
     assert cfg.zero_shot_box_threshold == 0.35
     assert cfg.zero_shot_text_threshold == 0.30
     assert cfg.minimap_max_range == 10.0
+
+
+def test_bev_scale_default_is_auto() -> None:
+    cfg = _cfg()
+    assert cfg.bev_scale_px_per_range_unit is None
+
+
+def test_bev_auto_scale_is_substantially_larger_than_legacy_fixed_scale() -> None:
+    cfg = _cfg()
+    scale = bev_scale_px_per_range_unit(cfg)
+    assert scale > 18.0
+
+
+def test_bev_auto_scale_allocates_substantial_vertical_span_for_full_range() -> None:
+    cfg = _cfg()
+    scale = bev_scale_px_per_range_unit(cfg)
+    assert cfg.bev_max_range * scale >= 500.0
 
 
 def test_direction_index_parsing() -> None:
