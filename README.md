@@ -4,7 +4,7 @@
 This repository implements a qualitative course-project pipeline that builds an ego-centered 360° minimap from single-camera images captured at a fixed location while rotating in place. The primary output is an **object-level minimap** generated from projected detection rows. A separate **stitched BEV** image is also generated as a **pixel-level diagnostic** from rotated per-image BEV rasters. The system is intended for explainable visualization and demo discussion, not calibrated autonomous-driving mapping.
 
 ## 2) Course requirement alignment
-This project uses multiple CV tasks from class:
+This project uses multiple CV tasks:
 - semantic segmentation (SegFormer),
 - monocular depth estimation (DPT),
 - object detection (Mask R-CNN, optional Grounding DINO),
@@ -24,8 +24,6 @@ repo_root/
     loc2/
       ...
 ```
-
-The pipeline expects `repo_root/data/` (not `data/data/`).
 
 ## 4) Direction convention (clockwise)
 - `direction 0` = forward/up on minimap.
@@ -109,7 +107,7 @@ Then open `final-project-cse5509-v2.ipynb` and run top-to-bottom.
 - False positives/missed detections can occur.
 
 ## 13) AI usage statement
-AI tools were used for code cleanup, docstring/documentation drafting, and notebook organization. Final claims and technical limitations were reviewed and kept consistent with a qualitative course-project scope.
+ChatGPT and Codex were used for code cleanup, documentation drafting, and notebook organization. Final claims and technical limitations were reviewed and kept consistent with a qualitative course-project scope.
 
 ## 14) Troubleshooting
 - **Missing `data/`**: verify dataset is in `repo_root/data/loc*/direction*.jpg`.
